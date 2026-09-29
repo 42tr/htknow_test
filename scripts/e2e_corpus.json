@@ -1,0 +1,396 @@
+{
+  "version": 1,
+  "description": "HTKnow 端到端检索评测语料与黄金问题集（golden set）。所有文档均来自可公开下载的稳定来源，问题与期望关键词均已逐条对照原文核实，可直接用于 Hit@K / MRR / nDCG 等信息检索指标计算。",
+  "defaults": {
+    "slice_type": "smart",
+    "top_k": 10,
+    "grade": 2
+  },
+  "documents": [
+    {
+      "id": "art_of_war",
+      "filename": "art-of-war-giles.txt",
+      "format": "txt",
+      "language": "en",
+      "license": "Project Gutenberg — Public Domain",
+      "homepage": "https://www.gutenberg.org/ebooks/132",
+      "description": "《孙子兵法》Lionel Giles 英译全本（约 315KB 纯文本）。用于验证纯文本解析管线、长文档切片与英文关键词召回。",
+      "sources": [
+        {
+          "url": "https://www.gutenberg.org/files/132/132-0.txt",
+          "sha256": "0aa964ddb252df7f02e84174ff1a65c6fd971c067303c1da320f5734a3b05c37"
+        },
+        {
+          "url": "https://www.gutenberg.org/cache/epub/132/pg132.txt",
+          "sha256": "c478f7e05a07bf190585fcea0bc4658ce22e47949ac18444eca53fb274878ffe"
+        }
+      ],
+      "queries": [
+        {
+          "id": "aow-01",
+          "intent": "精确原文引用召回",
+          "query": "All warfare is based on deception",
+          "keywords_all": [
+            "warfare",
+            "deception"
+          ],
+          "expect_rank_max": 3
+        },
+        {
+          "id": "aow-02",
+          "intent": "释义型问句 → 原文定位",
+          "query": "Why is the art of war of vital importance to the State according to Sun Tzu",
+          "keywords_all": [
+            "art of war",
+            "vital importance"
+          ]
+        },
+        {
+          "id": "aow-03",
+          "intent": "名句语义召回",
+          "query": "If you know the enemy and know yourself you need not fear the result of a hundred battles",
+          "keywords_all": [
+            "know the enemy",
+            "hundred battles"
+          ]
+        },
+        {
+          "id": "aow-04",
+          "intent": "细节事实召回",
+          "query": "the five dangerous faults which may affect a general",
+          "keywords_all": [
+            "five dangerous faults",
+            "general"
+          ]
+        },
+        {
+          "id": "aow-05",
+          "intent": "跨段落细节召回",
+          "query": "one cartload of the enemy's provisions is equivalent to twenty of one's own",
+          "keywords_all": [
+            "provisions",
+            "cartload"
+          ]
+        },
+        {
+          "id": "aow-06",
+          "intent": "章节主题召回",
+          "query": "the nine varieties of ground",
+          "keywords_all": [
+            "nine varieties of ground"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sanguo_yanyi",
+      "filename": "sanguo-yanyi-zh.txt",
+      "format": "txt",
+      "language": "zh-Hant",
+      "license": "Project Gutenberg — Public Domain",
+      "homepage": "https://www.gutenberg.org/ebooks/23950",
+      "description": "《三國演義》繁体中文全本（约 1.8MB）。用于验证中文 jieba 分词、中文长文本切片与中文关键词召回。",
+      "sources": [
+        {
+          "url": "https://www.gutenberg.org/files/23950/23950-0.txt",
+          "sha256": "c8ca016d417dbd9540ed854ed02c97cf3d7aca13dd88b7e08555ffd2c0e5e2c3"
+        },
+        {
+          "url": "https://www.gutenberg.org/cache/epub/23950/pg23950.txt",
+          "sha256": "ed422e10c16c19af7ca7b09ca0320012e60776b3d7cb054769b8f7d9a19aea7d"
+        }
+      ],
+      "queries": [
+        {
+          "id": "sg-01",
+          "intent": "开篇名句召回",
+          "query": "話說天下大勢 分久必合 合久必分",
+          "keywords_all": [
+            "分久必合",
+            "合久必分"
+          ]
+        },
+        {
+          "id": "sg-02",
+          "intent": "回目事件召回",
+          "query": "宴桃園豪傑三結義 斬黃巾英雄首立功",
+          "keywords_all": [
+            "桃園"
+          ],
+          "keywords_any": [
+            "結義",
+            "黃巾"
+          ]
+        },
+        {
+          "id": "sg-03",
+          "intent": "人物情节召回",
+          "query": "劉玄德三顧草廬 請諸葛亮出山",
+          "keywords_all": [
+            "諸葛亮"
+          ],
+          "keywords_any": [
+            "三顧",
+            "玄德",
+            "草廬"
+          ]
+        },
+        {
+          "id": "sg-04",
+          "intent": "战役事件召回",
+          "query": "赤壁鏖兵用火攻 龐統連環計 公瑾",
+          "keywords_all": [
+            "赤壁"
+          ],
+          "keywords_any": [
+            "火攻",
+            "連環",
+            "公瑾"
+          ]
+        },
+        {
+          "id": "sg-05",
+          "intent": "人物细节召回",
+          "query": "貂蟬 教以歌舞 色伎俱佳",
+          "keywords_all": [
+            "貂蟬"
+          ]
+        },
+        {
+          "id": "sg-06",
+          "intent": "高频实体召回",
+          "query": "曹操 挾天子以令諸侯",
+          "keywords_all": [
+            "曹操"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rag_paper",
+      "filename": "retrieval-augmented-generation-arxiv-2005.11401.pdf",
+      "format": "pdf",
+      "language": "en",
+      "license": "arXiv — Lewis et al., NeurIPS 2020",
+      "homepage": "https://arxiv.org/abs/2005.11401",
+      "description": "RAG 原始论文 PDF（19 页，约 865KB）。用于验证 MinerU PDF 解析管线、公式/表格密集版面的切片质量与学术事实召回。",
+      "sources": [
+        {
+          "url": "https://arxiv.org/pdf/2005.11401v4",
+          "sha256": "23e3249e9a1e75418d82efecab0ea8c4d033b89c93742f63208d47ce01f21233"
+        },
+        {
+          "url": "https://arxiv.org/pdf/2005.11401",
+          "sha256": null
+        }
+      ],
+      "queries": [
+        {
+          "id": "rag-01",
+          "intent": "组件事实召回",
+          "query": "Which retriever provides latent documents in the RAG model",
+          "keywords_all": [
+            "DPR"
+          ],
+          "keywords_any": [
+            "Dense Passage Retriever",
+            "bi-encoder"
+          ],
+          "expect_rank_max": 3
+        },
+        {
+          "id": "rag-02",
+          "intent": "组件事实召回",
+          "query": "What seq2seq model is used as the generator component of RAG",
+          "keywords_all": [
+            "BART",
+            "generator"
+          ]
+        },
+        {
+          "id": "rag-03",
+          "intent": "数值细节召回",
+          "query": "non-parametric memory dense vector index of Wikipedia 21M documents",
+          "keywords_all": [
+            "21M"
+          ],
+          "keywords_any": [
+            "Wikipedia",
+            "non-parametric"
+          ]
+        },
+        {
+          "id": "rag-04",
+          "intent": "模型对比召回",
+          "query": "difference between RAG-Sequence and RAG-Token",
+          "keywords_all": [
+            "RAG-Sequence",
+            "RAG-Token"
+          ]
+        },
+        {
+          "id": "rag-05",
+          "intent": "实验结论召回",
+          "query": "state-of-the-art results on open domain QA Natural Questions TriviaQA WebQuestions",
+          "keywords_all": [
+            "Natural Questions"
+          ],
+          "keywords_any": [
+            "TriviaQA",
+            "WebQuestions",
+            "CuratedTrec"
+          ]
+        },
+        {
+          "id": "rag-06",
+          "intent": "索引实现细节召回",
+          "query": "FAISS MIPS index with Hierarchical Navigable Small World approximation",
+          "keywords_all": [
+            "FAISS"
+          ],
+          "keywords_any": [
+            "Hierarchical Navigable Small World",
+            "MIPS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "somatosensory",
+      "filename": "somatosensory-anatomy-css4pub.pdf",
+      "format": "pdf",
+      "language": "en",
+      "license": "css4.pub sample — Wikibooks \"Sensory Systems\" (CC BY-SA)",
+      "homepage": "https://css4.pub/2015/textbook/somatosensory.pdf",
+      "description": "小篇幅多栏学术 PDF（4 页，约 142KB），含图注与分栏排版。用于验证小文件解析速度与复杂版面下的召回稳定性。",
+      "sources": [
+        {
+          "url": "https://css4.pub/2015/textbook/somatosensory.pdf",
+          "sha256": "ea29f75c0e30b60471aa0b659f6b203f048957fe654d9db843c4c3525d931185"
+        }
+      ],
+      "queries": [
+        {
+          "id": "som-01",
+          "intent": "术语定义召回",
+          "query": "cutaneous receptors temperature thermoreceptors pressure mechanoreceptors pain nociceptors",
+          "keywords_all": [
+            "thermoreceptors"
+          ],
+          "keywords_any": [
+            "nociceptors",
+            "mechano"
+          ]
+        },
+        {
+          "id": "som-02",
+          "intent": "生理机制召回",
+          "query": "Meissner corpuscles adjustment of grip force when objects are lifted",
+          "keywords_all": [
+            "Meissner"
+          ],
+          "keywords_any": [
+            "grip force",
+            "gripforce"
+          ]
+        },
+        {
+          "id": "som-03",
+          "intent": "分类事实召回",
+          "query": "encapsulated receptors Pacinian corpuscles glabrous hairless skin Ruffini Merkel",
+          "keywords_all": [
+            "Pacinian"
+          ],
+          "keywords_any": [
+            "glabrous",
+            "Ruffini",
+            "Merkel"
+          ]
+        },
+        {
+          "id": "som-04",
+          "intent": "跨段落事实召回",
+          "query": "receptors in muscles and joints provide muscle length muscle tension joint angles",
+          "keywords_all": [
+            "muscle"
+          ],
+          "keywords_any": [
+            "joint angles",
+            "muscle tension"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "calibre_docx_demo",
+      "filename": "calibre-docx-demo.docx",
+      "format": "docx",
+      "language": "en",
+      "optional": true,
+      "license": "calibre demo document",
+      "homepage": "https://calibre-ebook.com/downloads/demos/demo.docx",
+      "description": "Word DOCX 样例（约 1.3MB，含图片、表格、脚注、嵌入字体）。用于验证 Office → PDF 转换链路；未部署转换服务时会自动跳过而不判失败。",
+      "sources": [
+        {
+          "url": "https://calibre-ebook.com/downloads/demos/demo.docx",
+          "sha256": "269329fc7ae54b3f289b3ac52efde387edc2e566ef9a48d637e841022c7e0eab"
+        }
+      ],
+      "queries": [
+        {
+          "id": "docx-01",
+          "intent": "功能清单召回",
+          "query": "calibre DOCX input plugin supported features images tables lists footnotes endnotes dropcaps",
+          "keywords_all": [
+            "calibre"
+          ],
+          "keywords_any": [
+            "footnotes",
+            "dropcaps",
+            "DOCX"
+          ]
+        },
+        {
+          "id": "docx-02",
+          "intent": "细节事实召回",
+          "query": "which font family is embedded in this demonstration document",
+          "keywords_all": [
+            "Ubuntu"
+          ],
+          "keywords_any": [
+            "embedded",
+            "font"
+          ]
+        },
+        {
+          "id": "docx-03",
+          "intent": "操作步骤召回",
+          "query": "convert to AZW3 for Kindles or EPUB for other ebook readers",
+          "keywords_all": [
+            "AZW3"
+          ],
+          "keywords_any": [
+            "EPUB",
+            "Kindle"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "needle_synthetic",
+      "generator": "needle",
+      "filename": "htk-needle-haystack.txt",
+      "format": "txt",
+      "language": "en",
+      "license": "本地生成（无需联网）",
+      "description": "确定性「大海捞针」合成文档：64 段填充文本中埋入唯一标识 token。不依赖任何外部解析质量，用于隔离验证 上传→切片→Tantivy 索引→检索 链路本身的正确性，并提供无泄漏负样本对照。",
+      "needle": {
+        "paragraphs": 64,
+        "queries": 6,
+        "negatives": 3,
+        "min_words_per_paragraph": 60,
+        "token_prefix": "HTKN"
+      }
+    }
+  ]
+}

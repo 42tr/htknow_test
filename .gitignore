@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行产物（自动生成，勿提交）
+/scripts/.corpus/
+/scripts/corpus/
+/scripts/reports/
+/scripts/.e2e-web/
+*.log
+
+# 归档报告
+*.tar.gz
+
+.DS_Store

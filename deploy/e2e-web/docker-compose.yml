@@ -1,0 +1,22 @@
+services:
+  e2e-web:
+    image: htknow-e2e-web:latest
+    container_name: htknow-e2e-web
+    restart: unless-stopped
+    # host 网络：控制台能直接测局域网与本机任意地址（如 192.168.0.46:11000、127.0.0.1:3999），
+    # 服务监听在宿主机 ${E2E_WEB_PORT:-8099} 端口。
+    network_mode: host
+    # 若不想用 host 网络，注释掉上一行并改用下面两行（测宿主机自身服务时用 host.docker.internal）：
+    # ports:
+    #   - "8099:8099"
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    environment:
+      E2E_WEB_PORT: "8099"
+      E2E_MAX_CONCURRENT: "2"
+      E2E_MAX_HISTORY: "50"
+    volumes:
+      - e2e-web-data:/data
+
+volumes:
+  e2e-web-data:
