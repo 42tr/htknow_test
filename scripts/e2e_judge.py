@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.5"
+JUDGE_VERSION = "htknow-answer-v6.6"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -402,10 +402,38 @@ def accuracy_response_format(data: Dict[str, Any]) -> Dict[str, Any]:
     facts = {"type": "array", "items": False, "minItems": len(entries), "maxItems": len(entries)}
     if entries:
         facts["prefixItems"] = entries
+    else:
+        facts["const"] = []
     schema = obj({"facts": facts, "behavior": {"type": "string", "enum": ["answer", "abstain", "partial"]},
                   "behavior_ok": {"type": "boolean"}, "task_ok": {"type": "boolean"},
                   "reason": {"type": "string", "maxLength": 400}})
     return {"type": "json_schema", "json_schema": {"name": "answer_accuracy", "strict": True, "schema": schema}}
+
+
+def citation_response_format(data: Dict[str, Any]) -> Dict[str, Any]:
+    def obj(properties):
+        return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+    def fixed(items):
+        schema = {"type": "array", "items": False, "minItems": len(items), "maxItems": len(items)}
+        if items:
+            schema["prefixItems"] = items
+        else:
+            schema["const"] = []
+        return schema
+    checks = []
+    for check in data.get("checks", []):
+        ids = [passage["id"] for passage in check["source"].get("passages", [])]
+        passages = ({"type": "array", "items": {"type": "integer", "enum": ids}}
+                    if ids else {"type": "array", "items": False, "maxItems": 0})
+        checks.append(obj({"id": {"type": "string", "const": check["id"]},
+                           "supported": {"type": "boolean"}, "passage_ids": passages}))
+    properties = {"checks": fixed(checks)}
+    if "information_limit_checks" in data:
+        properties["information_limit_checks"] = fixed([obj({
+            "claim_index": {"type": "integer", "const": limit["claim_index"]},
+            "is_information_limit": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 240}})
+            for limit in data["information_limit_checks"]])
+    return {"type": "json_schema", "json_schema": {"name": "citation_checks", "strict": True, "schema": obj(properties)}}
 
 
 def indexed_spans(text: str, *, sentences: bool = False) -> List[Dict[str, Any]]:
@@ -588,7 +616,8 @@ class Judge:
         return {"mode": self.mode, "model": self.model or None, "prompt_version": JUDGE_VERSION,
                 "prompt_sha256": hashlib.sha256((ACCURACY_PROMPT + GROUNDING_PROMPT + REPAIR_PROMPT + CITATION_CHECK_PROMPT + LIMIT_CHECK_PROMPT).encode()).hexdigest(),
                 "temperature": 0, "endpoint": self.url or None, "requests": self.request_count,
-                "accuracy_schema_version": 1, "accuracy_schema_supported": getattr(self, "_schema_supported", None)}
+                "accuracy_schema_version": 1, "citation_schema_version": 1,
+                "accuracy_schema_supported": getattr(self, "_schema_supported", None)}
 
     def _call(self, name: str, system: str, data: Dict[str, Any], directory: Path) -> Dict[str, Any]:
         body = {"model": self.model, "temperature": 0, "stream": False,
@@ -596,6 +625,8 @@ class Judge:
                              {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
         if name.startswith("accuracy") and getattr(self, "_schema_supported", None) is not False:
             body["response_format"] = accuracy_response_format(data)
+        elif "checks" in data and getattr(self, "_schema_supported", None) is not False:
+            body["response_format"] = citation_response_format(data)
         (directory / f"judge-{name}-request.json").write_text(json.dumps(body, ensure_ascii=False, indent=2))
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.key:

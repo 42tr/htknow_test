@@ -36,6 +36,18 @@ class GroundingAlignmentTests(unittest.TestCase):
         self.assertNotIn("const", entries[0]["properties"]["label"])
         self.assertEqual(entries[1]["properties"]["answer_span_ids"]["items"]["enum"], [1, 2])
 
+    def test_citation_schema_pins_checks_and_only_allows_the_checked_source_passages(self):
+        data = {"checks": [{"id": "0:2", "source": {"passages": [{"id": 3}, {"id": 5}]}},
+                           {"id": "0:9", "source": {"passages": []}}],
+                "information_limit_checks": [{"claim_index": 4}]}
+        schema = judging.citation_response_format(data)["json_schema"]["schema"]["properties"]
+        checks = schema["checks"]["prefixItems"]
+        self.assertEqual([c["properties"]["id"]["const"] for c in checks], ["0:2", "0:9"])
+        self.assertEqual(checks[0]["properties"]["passage_ids"]["items"]["enum"], [3, 5])
+        self.assertEqual(checks[1]["properties"]["passage_ids"]["maxItems"], 0)
+        self.assertNotIn("const", checks[0]["properties"]["supported"])
+        self.assertEqual(schema["information_limit_checks"]["prefixItems"][0]["properties"]["claim_index"]["const"], 4)
+
     def test_explicit_schema_capability_rejection_falls_back_once_and_caches_it(self):
         opener = MagicMock()
         response = MagicMock()
@@ -369,6 +381,16 @@ class GroundingAlignmentTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("E2E_JUDGE_LIVE_TESTS") == "1", "opt-in live judge checks")
 class LiveGroundingAlignmentTests(unittest.TestCase):
+    def test_accuracy_schema_handles_empty_reference_facts(self):
+        judge = judging.Judge()
+        answer = "当前资料不足，无法确认。"
+        with tempfile.TemporaryDirectory() as directory:
+            result = judge._call("accuracy", judging.ACCURACY_PROMPT,
+                {"question": "资料未记载的事项", "reference_facts": [], "expected_behavior": "abstain",
+                 "answer": answer, "answer_spans": judging.answer_spans(answer)}, Path(directory))
+        self.assertEqual(result["result"]["facts"], [])
+        judging.validate_accuracy(result["result"], [], answer)
+
     def test_accuracy_schema_enforces_ids_even_when_prompt_requests_duplicates(self):
         judge = judging.Judge()
         answer = "单价40元。数量3个。"
