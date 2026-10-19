@@ -25,6 +25,32 @@ def claim():
 
 
 class GroundingAlignmentTests(unittest.TestCase):
+    def test_same_cited_source_can_supply_several_premises_without_duplicate_citation_counts(self):
+        item = claim()
+        item["claim"] = "两项经费有不同数值"
+        item["citations"].append({"source_id": 1, "supported": True, "passage_ids": [3]})
+        result = judging.validate_grounding({"claims": [item]}, [SOURCE], "两项经费有不同数值[1]。", True)
+        citations = result["claims"][0]["citations"]
+        self.assertEqual(len(citations), 1)
+        self.assertEqual(citations[0]["passage_ids"], [2, 3])
+        self.assertIn("基础预算：112万元。", citations[0]["quote"])
+        self.assertIn("独立预备金：36万元。", citations[0]["quote"])
+        self.assertIn(citations[0]["quote"], SOURCE["result"]["content"])
+
+    def test_conflicting_same_source_verdicts_still_require_model_repair(self):
+        item = claim()
+        item["citations"].append({"source_id": 1, "supported": False, "passage_ids": []})
+        with self.assertRaises(judging.JudgeError):
+            judging.validate_grounding({"claims": [item]}, [SOURCE], "基础预算112万元[1]。", True)
+
+    def test_merging_same_source_premises_never_hides_invalid_evidence(self):
+        for ids in ([999], [True], []):
+            with self.subTest(ids=ids):
+                item = claim()
+                item["citations"].append({"source_id": 1, "supported": True, "passage_ids": ids})
+                with self.assertRaises(judging.JudgeError):
+                    judging.validate_grounding({"claims": [item]}, [SOURCE], "基础预算112万元[1]。", True)
+
     def test_accuracy_schema_pins_ids_without_forcing_positive_semantic_labels(self):
         data = {"reference_facts": [{"id": "price"}, {"id": "quantity"}], "answer_spans": [{"id": 1}, {"id": 2}]}
         schema = judging.accuracy_response_format(data)["json_schema"]["schema"]

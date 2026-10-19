@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.6"
+JUDGE_VERSION = "htknow-answer-v6.7"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -122,7 +122,9 @@ Assess factual support using ALL visible sources, even if the answer omitted a
 citation. A correct uncited fact is supported with evidence in support and an
 empty citations list. Missing citation and missing factual support are separate.
 List every distinct citation attached to the quote in citations, with a supported
-boolean and passage_ids from THAT cited source when true. For a direct fact the
+boolean and passage_ids from THAT cited source when true. Use a SINGLE entry per
+source. If it supplies multiple premises, select all their passage_ids together
+in that entry. Do not duplicate source_id for different passages. For a direct fact the
 source must support that fact. For a calculation, comparison or multi-hop entity
 relation, a source is valid when it provides a NECESSARY premise of the joint
 proof using the attached sources; it need not independently entail the conclusion.
@@ -553,10 +555,20 @@ def validate_grounding(payload: Any, sources: List[Dict[str, Any]], answer: str,
             if not isinstance(citation, dict) or type(citation.get("source_id")) is not int:
                 raise JudgeError("引用评审格式无效")
             sid = citation["source_id"]
-            if sid in supplied:
-                raise JudgeError("引用评审存在重复编号")
-            supplied.add(sid)
             supported = _bool(citation.get("supported"), "citation.supported")
+            if sid in supplied:
+                previous = next((entry for entry in aligned if entry["source_id"] == sid), None)
+                if (supported and previous and previous["supported"] is True
+                        and "passage_ids" in previous and "passage_ids" in citation):
+                    # One attached source may provide several premises. Preserve
+                    # and validate every selected passage, then count its one
+                    # actual citation once. Conflicting verdicts stay errors.
+                    evidence_quote(citation, f"claims[{index}].citations[{citation_index}].quote", "citation quote")
+                    previous["passage_ids"] = sorted(set(previous["passage_ids"]) | set(citation["passage_ids"]))
+                    previous["quote"] = evidence_quote(previous, f"claims[{index}].citations[{citation_index}].quote", "citation quote")
+                    continue
+                raise JudgeError("引用评审存在重复编号或冲突判定")
+            supplied.add(sid)
             # Attachment is a property of the immutable answer, not a semantic
             # model decision. An unrelated source cannot become an answer citation.
             if sid not in attached:
