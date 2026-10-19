@@ -9,7 +9,9 @@ CTX="$(mktemp -d "${TMPDIR:-/tmp}/htknow-e2e-web-ctx.XXXXXX")"
 trap 'rm -rf "$CTX"' EXIT
 
 cp "$REPO/scripts/e2e_web.py" "$REPO/scripts/e2e_retrieval_test.py" \
-   "$REPO/scripts/e2e_corpus.json" "$CTX/"
+   "$REPO/scripts/e2e_corpus.json" "$REPO/scripts/e2e_answer_eval.py" \
+   "$REPO/scripts/e2e_judge.py" "$REPO/scripts/e2e_answer_report.py" \
+   "$REPO/scripts/e2e_answer_cases.json" "$CTX/"
 cp "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$CTX/"
 mkdir -p "$CTX/corpus"
 
@@ -22,7 +24,7 @@ for cand in "$REPO/scripts/.corpus" "$REPO/scripts/corpus"; do
 done
 if [ -n "$CORPUS" ]; then
   find "$CORPUS" -maxdepth 1 -type f -exec cp {} "$CTX/corpus/" \;
-  echo "语料已烘入镜像：$CORPUS（$(du -sh "$CTX/corpus" | cut -f1)）"
+  echo "语料已烘入镜像：${CORPUS}（$(du -sh "$CTX/corpus" | cut -f1)）"
 else
   echo "未找到本地语料缓存：镜像不含语料，首次运行将联网下载（或挂载语料卷）"
 fi

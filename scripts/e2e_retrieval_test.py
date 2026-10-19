@@ -896,15 +896,18 @@ def build_gates(args: argparse.Namespace, metrics: Dict[str, Any],
             return
         if actual is None:
             gates.append(GateResult(name, metric, None, threshold, comparator, unit,
-                                    False, False, note or "无实测数据，未参与判定"))
+                                    False, critical, note or "缺少实测数据，关键门禁未通过"))
             return
         passed = actual >= threshold if comparator == ">=" else actual <= threshold
         gates.append(GateResult(name, metric, actual, threshold, comparator, unit, passed, critical, note))
 
-    add("解析成功率", "parse_success_rate", parse_stats.get("success_rate"), args.min_parse_success,
+    add("解析成功率", "parse_success_rate", parse_stats.get("success_rate"),
+        args.min_parse_success if parse_stats.get("evaluated_required", 0) else None,
         ">=", "%", args.min_parse_success > 0,
         f"必测文档成功 {parse_stats.get('parsed_ok_required', 0)} / "
         f"{parse_stats.get('evaluated_required', 0)}（optional 文档不计入）")
+    add("检索问题执行覆盖率", "query_coverage", metrics.get("query_coverage"), 100.0, ">=", "%",
+        note="下载、解析、检索请求失败不能从必测问题中剔除")
     add(f"Hit@{metrics['eval_k']}", "hit_rate", metrics.get("hit_rate"), args.min_hit_rate, ">=", "%")
     add(f"MRR@{metrics['eval_k']}", "mrr", metrics.get("mrr"), args.min_mrr, ">=", "")
     add(f"nDCG@{metrics['eval_k']}", "ndcg", metrics.get("ndcg"), args.min_ndcg, ">=", "")
@@ -912,7 +915,8 @@ def build_gates(args: argparse.Namespace, metrics: Dict[str, Any],
         args.min_answer_in_context, ">=", "%")
     add("关键词覆盖率", "keyword_coverage", metrics.get("keyword_coverage"), args.min_keyword_coverage,
         ">=", "%", False)
-    add("负样本对照通过率", "negative_pass_rate", metrics.get("negative_pass_rate"), 100.0, ">=", "%",
+    add("负样本对照通过率", "negative_pass_rate", metrics.get("negative_pass_rate"),
+        100.0 if metrics.get("negative_total", 0) else None, ">=", "%",
         args.require_negatives, "假阳性检验：未注入内容不应被召回")
     add("检索 P95 延迟", "search_p95_ms", (metrics.get("latency") or {}).get("p95"),
         args.max_p95_ms or None, "<=", "ms", args.max_p95_ms > 0)
@@ -1148,6 +1152,9 @@ header.top{background:#0f172a !important;-webkit-print-color-adjust:exact}}
 
 
 def render_html(report: Dict[str, Any]) -> str:
+    if report["config"].get("mode") == "chat":
+        from e2e_answer_eval import render_report
+        return render_report(report, CSS)
     cfg, metrics = report["config"], report["metrics"]
     parse, gate_rows = report["parse"], report["gates"]
     queries: List[Dict[str, Any]] = report["queries"]
@@ -1168,7 +1175,7 @@ def render_html(report: Dict[str, Any]) -> str:
     verdict_txt = "PASS" if overall else "FAIL"
     failed_gates = [g for g in gate_rows
                     if g["critical"] and not g["passed"]
-                    and g["threshold"] is not None and g["actual"] is not None]
+                    and g["threshold"] is not None]
     out.append(f"""
 <header class="top"><div class="verdict {verdict_cls}"><div class="big">{verdict_txt}</div>
 <div class="small">{len(failed_gates)} 项关键门禁未达标</div></div>
@@ -1200,7 +1207,8 @@ def render_html(report: Dict[str, Any]) -> str:
         ("解析 P95", fmt_num((parse.get("latency") or {}).get("p95"), 0), "ms"),
     ]
     out.append('<section><h2>结果概览</h2><p class="desc">'
-               '一次运行的关键结论。所有比率均以「成功解析并入索引的文档」为分母。</p><div class="cards">')
+               '解析成功率按全部必测文档统计，检索质量按有效问题统计，并单独检查执行覆盖率；'
+               '答案评估保留所有计划用例，单列语义评审覆盖率。</p><div class="cards">')
     for label, value, unit in cards:
         out.append(f'<div class="card"><div class="k">{esc(label)}</div>'
                    f'<div class="v">{esc(value)}<span class="u">{esc(unit)}</span></div></div>')
@@ -1233,7 +1241,7 @@ def render_html(report: Dict[str, Any]) -> str:
             state_cell = '<span class="badge na">未启用</span>'
             threshold = "-"
         elif actual is None:
-            state_cell = '<span class="badge na">无数据</span>'
+            state_cell = '<span class="badge bad">无数据，未通过</span>' if gate["critical"] else '<span class="badge na">无数据</span>'
         else:
             state_cell = badge(gate["passed"])
         out.append(f'<tr><td>{esc(gate["name"])}</td><td class="mono">{esc(gate["metric"])}</td>'
@@ -1504,6 +1512,10 @@ def render_html(report: Dict[str, Any]) -> str:
                    f'<td class="c">{badge(negative["passed"], "无泄漏", "泄漏: " + "、".join(leaked))}</td></tr>')
     out.append("</tbody></table></section>")
 
+    if report.get("answers"):
+        from e2e_answer_eval import render_section
+        out.append(render_section(report["answers"]))
+
     # ---- 结论 ----
     out.append('<section><h2>结论与排查建议</h2>')
     if overall:
@@ -1522,7 +1534,10 @@ def render_html(report: Dict[str, Any]) -> str:
                f'run {esc(cfg["run_id"])} · {esc(cfg["finished_at"])} · '
                f'共发出 {esc(cfg["request_count"])} 次 HTTP 请求</footer>')
     out.append("</div></body></html>")
-    return "".join(out)
+    result = "".join(out)
+    if cfg.get("mode") == "both":
+        result = result.replace("端到端检索测试报告", "检索与答案测试报告")
+    return result
 # --------------------------------------------------------------------------- #
 # 诊断建议
 # --------------------------------------------------------------------------- #
@@ -1893,7 +1908,9 @@ def summarize(args: argparse.Namespace, docs: Sequence[DocResult],
     failed = [d for d in docs if d.stage in ("parse_failed", "parse_timeout", "upload_failed")]
     skipped_optional = [d for d in docs if d.stage in ("download_failed", "skipped")]
     # optional=True 的文档依赖可选外部服务（如 Office 转换器），其失败降级为告警，不参与成功率门禁。
-    required_docs = [d for d in evaluated_docs if not d.optional]
+    # Missing downloads/uploads still count as failed required documents. Using
+    # only files with a server id silently removed those failures from the gate.
+    required_docs = [d for d in docs if not d.optional]
     required_ok = [d for d in required_docs if d.stage == "completed" and d.slices > 0]
     for doc in docs:
         if doc.optional and doc.stage in ("parse_failed", "parse_timeout", "upload_failed",
@@ -1929,6 +1946,10 @@ def summarize(args: argparse.Namespace, docs: Sequence[DocResult],
     metrics["negative_passed"] = sum(1 for n in neg_evaluated if n.passed)
     metrics["negative_pass_rate"] = (metrics["negative_passed"] / len(neg_evaluated) * 100.0) \
         if neg_evaluated else None
+    optional_ids = {d.doc_id for d in docs if d.optional}
+    required_queries = [q for q in queries if q.doc_id not in optional_ids] or list(queries)
+    metrics["query_coverage"] = (100.0 * sum(not q.skipped_reason and not q.error for q in required_queries)
+                                 / len(required_queries)) if required_queries else 0.0
     return metrics, parse, warnings
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1976,6 +1997,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     corpus.add_argument("--tags", action="append", default=["e2e-test"], help="上传标签，可重复")
 
     run = parser.add_argument_group("执行")
+    run.add_argument("--mode", choices=["retrieval", "chat", "both"], default="retrieval",
+                     help="retrieval=仅检索（默认）；chat=答案评估；both=完整链路")
     run.add_argument("--kb-name", help="知识库名称，默认 E2E检索测试-<时间戳>-<随机>")
     run.add_argument("--parse-priority", type=int, default=90, help="知识库解析优先级 0-100，默认 90")
     run.add_argument("--public", action="store_true", help="创建为公开知识库")
@@ -1993,6 +2016,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                      choices=["keep", "delete", "delete-on-pass"],
                      help="测试后知识库处置，默认 delete-on-pass（通过则删除，失败则保留现场）")
     run.add_argument("--dry-run", action="store_true", help="只准备并校验语料，不连接被测服务")
+
+    answer = parser.add_argument_group("生成答案评估（chat / both）")
+    answer.add_argument("--answer-cases", default=str(SCRIPT_DIR / "e2e_answer_cases.json"), help="答案题集 JSON")
+    answer.add_argument("--answer-categories", help="只测指定答案分类，逗号分隔")
+    answer.add_argument("--answer-limit", type=int, default=0, help="用例数量上限，0=全部")
+    answer.add_argument("--answer-repeats", type=int, default=1, help="每个对话用例重复次数，历史各自独立")
+    answer.add_argument("--answer-seed", help="合成事实随机种子，默认本次运行 ID；报告记录实际种子")
+    answer.add_argument("--rejudge-report", help="保留来源 JSON 报告的答案与证据，使用当前版本重新评审全部轮次")
+    answer.add_argument("--rejudge-errors-only", action="store_true", help="仅重评模型评审异常，继承其余评分并记录来源版本")
+    answer.add_argument("--answer-timeout", type=float, default=310, help="每轮对话总超时秒数")
+    answer.add_argument("--judge-mode", choices=["llm", "rules"], default="llm",
+                        help="llm=完整语义评估；rules=仅规则检查，语义门禁保持未通过")
+    answer.add_argument("--judge-url", help="独立评审模型的兼容接口，默认 E2E_JUDGE_URL")
+    answer.add_argument("--judge-model", help="评审模型名称，默认 E2E_JUDGE_MODEL")
+    answer.add_argument("--judge-timeout", type=float, default=120, help="单次评审超时秒数")
+    answer.add_argument("--min-answer-correctness", type=float, default=85)
+    answer.add_argument("--min-answer-faithfulness", type=float, default=95)
+    answer.add_argument("--min-citation-precision", type=float, default=95)
+    answer.add_argument("--min-citation-coverage", type=float, default=90)
+    answer.add_argument("--min-abstention-rate", type=float, default=90)
+    answer.add_argument("--max-answer-p95-ms", type=float, default=0, help="对话总耗时 P95 上限，0=不设门禁")
+    answer.add_argument("--max-first-text-ms", type=float, default=0, help="首段文本 P95 上限，0=不设门禁")
 
     gate = parser.add_argument_group("验收门禁")
     gate.add_argument("--min-parse-success", type=float, default=100.0, help="解析成功率下限 %%，默认 100")
@@ -2020,10 +2065,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--verbose-status", action="store_true",
                         help="打印每次文件状态变化（默认只在阶段切换时打印）")
     args = parser.parse_args(argv)
+    if args.rejudge_errors_only and not args.rejudge_report:
+        parser.error("--rejudge-errors-only 需要 --rejudge-report")
     if args.repeats < 1:
         parser.error("--repeats 至少为 1")
     if args.top_k < 1:
         parser.error("--top-k 至少为 1")
+    if args.answer_limit < 0 or not 1 <= args.answer_repeats <= 20:
+        parser.error("--answer-limit 必须非负；--answer-repeats 必须为 1 到 20")
+    for key in ("answer_timeout", "judge_timeout"):
+        if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
+            parser.error(f"--{key.replace('_', '-')} 必须是正数")
+    for key in ("min_answer_correctness", "min_answer_faithfulness", "min_citation_precision", "min_citation_coverage", "min_abstention_rate"):
+        if not math.isfinite(getattr(args, key)) or not 0 <= getattr(args, key) <= 100:
+            parser.error(f"--{key.replace('_', '-')} 必须为 0 到 100")
+    for key in ("max_answer_p95_ms", "max_first_text_ms"):
+        if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
+            parser.error(f"--{key.replace('_', '-')} 必须非负")
     return args
 
 
@@ -2058,7 +2116,7 @@ def console_summary(report: Dict[str, Any]) -> None:
           f"负样本 {fmt_num(metrics.get('negative_pass_rate'), 0)}%")
     print(f"{line}\n门禁")
     for gate in gates:
-        mark = ("·" if gate["threshold"] is None or gate["actual"] is None
+        mark = ("·" if gate["threshold"] is None or (gate["actual"] is None and not gate["critical"])
                 else ("✓" if gate["passed"] else "✗"))
         actual = fmt_num(gate["actual"], 2, " " + gate["unit"] if gate["unit"] else "")
         threshold = fmt_num(gate["threshold"], 2, " " + gate["unit"] if gate["unit"] else "")
@@ -2072,15 +2130,33 @@ def console_summary(report: Dict[str, Any]) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.rejudge_report:
+        from e2e_answer_eval import rejudge_report
+        return rejudge_report(args, sys.modules[__name__])
     run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
     report_started = now_iso()
     started = time.perf_counter()
     warnings: List[str] = []
 
-    specs, manifest = load_corpus(Path(args.corpus_file),
-                                  (args.docs or "").split(",") if args.docs else None,
-                                  (args.exclude or "").split(",") if args.exclude else None)
-    print(f"HTKnow 端到端检索测试 · run {run_id}")
+    answer_module = None
+    judge = None
+    if args.mode != "retrieval":
+        import e2e_answer_eval as answer_module
+        from e2e_judge import Judge, JudgeError
+        if not args.dry_run:
+            try:
+                judge = Judge(args.judge_url, args.judge_model, args.judge_timeout, args.judge_mode)
+            except JudgeError as exc:
+                raise HarnessError(str(exc)) from None
+    if args.mode == "chat" and not args.docs and not args.exclude and args.corpus_file == str(DEFAULT_CORPUS):
+        # Chat fixtures are self contained and do not require corpus downloads.
+        specs, manifest = [], {}
+    else:
+        specs, manifest = load_corpus(Path(args.corpus_file),
+                                      (args.docs or "").split(",") if args.docs else None,
+                                      (args.exclude or "").split(",") if args.exclude else None)
+    label = {"retrieval": "端到端检索测试", "chat": "生成答案测试", "both": "检索与答案完整测试"}[args.mode]
+    print(f"HTKnow {label} · run {run_id}")
     print(f"语料清单 {args.corpus_file}（version {manifest.get('version', '-')}），"
           f"选中文档 {len(specs)} 个，黄金问题 {sum(len(s.queries) for s in specs)} 条")
 
@@ -2093,7 +2169,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        fmt=path.suffix.lstrip(".").lower() or "bin", optional=True,
                        description="命令行额外上传的本地文件（不参与黄金问题评估）")
         extra_pairs.append((spec, DocResult(
-            doc_id=spec.id, filename=spec.filename, fmt=spec.fmt, optional=True,
+            doc_id=spec.id, filename=spec.filename, fmt=spec.fmt, language="", optional=True,
             stage="ready", source_url=str(path), integrity="local",
             size_bytes=path.stat().st_size, local_path=str(path), sha256=sha256_of(path),
             description=spec.description, started_at=report_started)))
@@ -2116,6 +2192,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("已清空语料缓存")
     workdir = cache_dir / "_workdir" / run_id
     workdir.mkdir(parents=True, exist_ok=True)
+    answer_suite = None
+    if answer_module:
+        try:
+            answer_suite = answer_module.prepare_suite(args, workdir, run_id, sys.modules[__name__])
+        except answer_module.AnswerError as exc:
+            raise HarnessError(str(exc)) from None
+        known_ids = {s.id for s in specs} | {s.id for s, _ in extra_pairs}
+        if known_ids & {p["spec"].id for p in answer_suite["pairs"]}:
+            raise HarnessError("答案 fixture 文档 ID 与原有语料或额外文件冲突")
+        extra_pairs += [(p["spec"], p["record"]) for p in answer_suite["pairs"] if p["scope"] == "main"]
+        print(f"答案用例 {len(answer_suite['cases'])} 个，随机种子 {answer_suite['seed']}")
 
     print("\n[1/6] 准备评测语料")
     docs, prep_warnings = prepare_corpus(args, client, workdir, cache_dir, run_id, specs)
@@ -2150,13 +2237,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         warnings.append("用户中断，已上传文件可能仍在解析")
         raise
 
-    print(f"\n[5/6] 执行黄金问题集检索（Top-K={args.top_k}，每条重复 {args.repeats} 次）")
-    queries, negatives, samples = run_retrieval(client, args, kb_id, specs, docs)
+    if args.mode != "chat":
+        print(f"\n[5/6] 执行黄金问题集检索（Top-K={args.top_k}，每条重复 {args.repeats} 次）")
+    else:
+        print("\n[5/6] 执行生成答案评估")
+    queries, negatives, samples = (run_retrieval(client, args, kb_id, specs, docs)
+                                   if args.mode != "chat" else ([], [], []))
+
+    report_path = Path(args.report) if args.report else SCRIPT_DIR / "reports" / f"e2e-report-{run_id}.html"
+    json_path = Path(args.json_report) if args.json_report else report_path.with_suffix(".json")
+    answers = None
+    fixture_cleanup = []
+    if answer_module and answer_suite:
+        print("\n执行对话答案评估（完整事件流与评审结果逐题保存）")
+        answers = answer_module.run_suite(answer_suite, args, client, sys.modules[__name__], workdir,
+                                          kb_id, docs, judge, report_path.parent / (report_path.stem + "-answers"))
+        fixture_cleanup = answers.pop("_cleanup")
 
     print("\n[6/6] 计算指标与生成报告")
     metrics, parse, summarize_warnings = summarize(args, docs, queries, negatives, samples)
     warnings += summarize_warnings
     gates = build_gates(args, metrics, parse)
+    if args.mode == "chat":
+        gates = [g for g in gates if g.metric in ("parse_success_rate", "parse_p95_ms")]
+    if answers:
+        gates += [GateResult(**g) for g in answers["gates"]]
     overall = all(g.passed for g in gates if g.critical and g.threshold is not None)
 
     disposition = "保留（--cleanup keep）"
@@ -2170,15 +2275,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warnings.append(f"清理知识库 #{kb_id} 失败：{exc}")
     else:
         disposition = f"保留现场 kb_id={kb_id}（{args.cleanup}）"
+    fixture_dispositions = []
+    for fixture_client, fixture_id in fixture_cleanup:
+        state = "保留现场"
+        if args.cleanup == "delete" or (args.cleanup == "delete-on-pass" and overall):
+            try:
+                fixture_client.delete(f"{API_ROOT}/knowledge_base/{fixture_id}")
+                state = "已删除"
+            except ApiFailure:
+                state = "删除失败"
+                warnings.append(f"答案 fixture 知识库 #{fixture_id} 清理失败")
+        fixture_dispositions.append({"kb_id": fixture_id, "disposition": state})
+    if answers:
+        answers["fixture_dispositions"] = fixture_dispositions
+        if answers["semantic_status"] != "complete":
+            warnings.append("答案语义评估未完整完成；规则检查结果不能作为语义验收通过结论。")
 
     total_ms = (time.perf_counter() - started) * 1000.0
-    report_path = Path(args.report) if args.report else \
-        SCRIPT_DIR / "reports" / f"e2e-report-{run_id}.html"
-    json_path = Path(args.json_report) if args.json_report else report_path.with_suffix(".json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_snapshot = {
-        "run_id": run_id, "target": base_url, "kb_id": kb_id, "kb_name": kb_name,
+        "run_id": run_id, "mode": args.mode, "target": base_url, "kb_id": kb_id, "kb_name": kb_name,
         "report_path": str(report_path), "json_report_path": str(json_path),
         "kb_disposition": disposition, "user_id": args.user_id, "role": args.role,
         "user_name": args.user_name, "slice_type": args.slice_type,
@@ -2200,13 +2317,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     negative_rows = [asdict(n) for n in negatives]
     compact_report_payloads(query_rows, negative_rows)
     report = {
-        "schema_version": 1, "config": config_snapshot, "environment": environment,
+        "schema_version": 2, "config": config_snapshot, "environment": environment,
         "documents": document_rows, "queries": query_rows, "negatives": negative_rows,
         "metrics": metrics, "parse": parse,
         "gates": [asdict(g) for g in gates], "warnings": warnings,
         "search_samples": sorted(samples), "overall_pass": overall,
         "hints": build_hints(document_rows, metrics, parse, warnings),
     }
+    if answers:
+        report["answers"] = answers
+        report["hints"] += list(dict.fromkeys(row["diagnosis"] for row in answers["rows"] if not row["passed"]))[:12]
+        print("答案评估：" + json.dumps(answers["metrics"], ensure_ascii=False))
     report_path.write_text(render_html(report), encoding="utf-8")
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str),
                          encoding="utf-8")

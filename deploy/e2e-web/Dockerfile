@@ -14,14 +14,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY e2e_web.py e2e_retrieval_test.py e2e_corpus.json ./
+COPY e2e_web.py e2e_retrieval_test.py e2e_corpus.json e2e_answer_eval.py e2e_judge.py e2e_answer_report.py e2e_answer_cases.json ./
 COPY entrypoint.sh /usr/local/bin/e2e-web-entrypoint
 # 可选：build.sh 会把本地语料缓存放进 corpus/；为空则镜像不烘语料，
 # 首次联网运行时自动从公网镜像下载并做 SHA-256 校验。
 COPY corpus/ ./corpus/
 
 RUN chmod +x /usr/local/bin/e2e-web-entrypoint \
-    && python3 -m py_compile e2e_web.py e2e_retrieval_test.py \
+    && python3 -m py_compile e2e_web.py e2e_retrieval_test.py e2e_answer_eval.py e2e_judge.py e2e_answer_report.py \
     && mkdir -p /data/runs
 
 # 运行产物（日志 / HTML / JSON 报告 / 历史元数据）持久化在 /data

@@ -15,6 +15,9 @@ services:
       E2E_WEB_PORT: "8099"
       E2E_MAX_CONCURRENT: "2"
       E2E_MAX_HISTORY: "50"
+      E2E_JUDGE_URL: "${E2E_JUDGE_URL:-}"
+      E2E_JUDGE_MODEL: "${E2E_JUDGE_MODEL:-}"
+      E2E_JUDGE_API_KEY: "${E2E_JUDGE_API_KEY:-}"
     volumes:
       - e2e-web-data:/data
 

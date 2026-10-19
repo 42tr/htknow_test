@@ -1,4 +1,4 @@
-# htknow_test · HTKnow 端到端检索测试
+# htknow_test · HTKnow 检索与答案评估
 
 对一次真实部署的 [HTKnow](https://github.com/42tr/htknow) 服务做
 「建库 → 上传 → 解析 → 索引 → 检索 → 指标评估 → 报告」的全链路自动化验收。
@@ -8,6 +8,8 @@
   计算 Hit@K / MRR@K / nDCG@K / 答案在上下文率 / 关键词覆盖率与延迟分位数
 - **门禁化**：任一关键门禁未达标即以退出码 `1` 失败，可直接接入 CI
 - **自包含报告**：单文件 HTML（内联 CSS + SVG，无 CDN），可离线在内网传阅、归档、打印
+- **生成答案评估**：60 个合成事实用例、70 轮请求，覆盖事实、汇总、无答案、多轮、Wiki 与权限隔离；
+  分别计算答案正确性、证据忠实度、引用质量与评审覆盖率
 
 本仓只含测试工具，不含被测服务代码。
 
@@ -17,6 +19,11 @@
 scripts/e2e_retrieval_test.py     测试主程序（CLI，可接入 CI）
 scripts/e2e_web.py                Web 控制台（浏览器操作 + 历史运行 + HTTP API）
 scripts/e2e_corpus.json           语料清单与黄金问题集（ground truth）
+scripts/e2e_answer_eval.py        对话评估入口、完整 SSE 采集与逐题证据报告
+scripts/e2e_answer_report.py      可筛选的逐题复盘、参考事实对照与引用证据定位
+scripts/e2e_answer_cases.json     60 个答案评估用例及运行时合成事实模板
+scripts/e2e_judge.py              独立模型评审、评分结构与证据引句校验
+tests/test_answer_eval.py         离线协议与端到端回归测试
 docs/e2e-retrieval-test.md        指标口径、门禁阈值、语料说明与排查建议
 deploy/e2e-web/                   Web 控制台的容器化部署（Dockerfile / compose / build.sh）
 ```
@@ -44,6 +51,49 @@ python3 scripts/e2e_retrieval_test.py --dry-run
 退出码：`0` 全部关键门禁达标；`1` 存在未达标项；`2` 脚本或环境错误。
 
 完整参数、测试流程、门禁阈值与失败排查见 [docs/e2e-retrieval-test.md](docs/e2e-retrieval-test.md)。
+
+## 生成答案评估
+
+默认仍为仅检索。答案评估使用独立的 OpenAI 兼容评审接口，与 HTKnow 自身的生成模型分别配置。
+评审接口支持完整的 `/chat/completions` 地址，也接受会自动追加该路径的 base URL。
+
+```shell
+export E2E_JUDGE_URL='https://your-provider.example/v1/chat/completions'
+export E2E_JUDGE_MODEL='your-judge-model'
+# 如果接口需要鉴权，在运行环境中设置 E2E_JUDGE_API_KEY。
+
+# 只评估对话：使用本地合成文档，不下载原有公开语料
+python3 scripts/e2e_retrieval_test.py --target 192.168.0.46:11000 --mode chat
+
+# 检索与答案共用主知识库，全部评估完成后再按整体结论清理
+python3 scripts/e2e_retrieval_test.py --target 192.168.0.46:11000 --mode both
+
+# 小规模试跑并固定事实，便于对比两个版本
+python3 scripts/e2e_answer_eval.py --target 192.168.0.46:11000 \
+  --answer-categories facts,multi_turn --answer-limit 3 --answer-seed baseline-v1
+
+# 只准备题集和事实文档，无需被测服务或评审模型
+python3 scripts/e2e_retrieval_test.py --mode chat --dry-run --offline
+
+# 只验证协议、精确事实与引用规则；语义门禁未通过，预期退出码为 1
+python3 scripts/e2e_retrieval_test.py --target 192.168.0.46:11000 \
+  --mode chat --judge-mode rules --answer-limit 2
+```
+
+Web 页面可选择「仅检索 / 对话答案 / 完整链路」，填写独立评审接口和模型，或继承启动进程的环境配置。
+密钥由服务端读取，不通过页面传入。配置了服务端密钥时，页面不能将该密钥转发到其他评审地址。
+本机也可将这三项写入已忽略的 `scripts/.e2e-web/judge.json`，供 CLI 和控制台在重启后读取；
+环境变量优先，`E2E_JUDGE_CONFIG` 可指定其他配置文件。密钥为空或 `None` 表示不附加鉴权头。
+
+完整答案、实际截断后的来源正文、历史、金标事实和评分保存在 HTML / JSON 报告中。
+报告旁的 `<报告名>-answers/<用例>/repeat-N/turn-N/` 保存原始 SSE、事件时间线和两次独立评审的请求、结果。
+没有评审配置时会在建库前报错；评审失败和断流会保留在计划分母内，不会作为通过样本。
+
+当前内置答案基线为运行时合成的业务事实，Wiki 对照页面由测试直接创建，用于检验证据使用和冲突处理；
+Wiki 自动生成质量不在这组用例的评估范围内。原有公开 TXT/PDF/DOCX 语料继续用于检索测试。
+`--answer-cases` 可加载自定义文本事实与问题；初始语义阈值需要结合人工复核校准。
+
+运行离线回归测试：`python3 -m unittest discover -s tests -v`。
 
 ## Web 控制台
 

@@ -10,7 +10,7 @@
 ./deploy/e2e-web/build.sh myreg/e2e-web:v1  # 自定义标签
 ```
 
-- `build.sh` 会先组装最小构建上下文（只含两个脚本 + 语料清单 + entrypoint），避免把
+- `build.sh` 会先组装最小构建上下文（控制台、测试与评分脚本、题集和 entrypoint），避免把
   `target/` 等大目录送进 build context
 - 若本机已有语料缓存（`scripts/.corpus/` 或 `scripts/corpus/`），会烘进镜像，容器可**完全离线**测试；
   没有则镜像不含语料，首次联网运行自动下载并做 SHA-256 校验
@@ -46,6 +46,13 @@ docker volume rm e2e-web_e2e-web-data                          # 彻底清空历
 | `E2E_RUNS_DIR` | `/data/runs` | 运行产物目录，建议保持在 `/data` 卷内 |
 | `E2E_MAX_CONCURRENT` | `2` | 同时运行的测试数量上限 |
 | `E2E_MAX_HISTORY` | `50` | 保留的历史运行条数，超出自动清理 |
+| `E2E_JUDGE_URL` | 空 | 独立答案评审接口，例如 `https://provider.example/v1/chat/completions` |
+| `E2E_JUDGE_MODEL` | 空 | 独立评审模型名称 |
+| `E2E_JUDGE_API_KEY` | 空 | 评审鉴权密钥，仅通过容器环境传入，不写入报告或命令行 |
+
+Compose 会从启动环境传入以上三项评审配置。配置后选择「对话答案」或「完整链路」即可运行语义评估。
+未配置时可以使用「仅规则检查」，但语义门禁会保持未通过；仅检索模式不需要评审模型。
+修改环境后重新创建容器，使新配置生效。
 
 ## 不用 host 网络（可选）
 

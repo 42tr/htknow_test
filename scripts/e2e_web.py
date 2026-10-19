@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shlex
 import shutil
@@ -59,15 +60,29 @@ NUMERIC_OPTIONS: Dict[str, Tuple[type, float, float]] = {
     "max_p95_ms": (float, 0, 3600000),
     "max_parse_ms": (float, 0, 3600000),
     "parse_priority": (int, 0, 100),
+    "answer_limit": (int, 0, 500),
+    "answer_repeats": (int, 1, 20),
+    "answer_timeout": (float, 1, 3600),
+    "judge_timeout": (float, 1, 3600),
+    "min_answer_correctness": (float, 0, 100),
+    "min_answer_faithfulness": (float, 0, 100),
+    "min_citation_precision": (float, 0, 100),
+    "min_citation_coverage": (float, 0, 100),
+    "min_abstention_rate": (float, 0, 100),
+    "max_answer_p95_ms": (float, 0, 3600000),
+    "max_first_text_ms": (float, 0, 3600000),
 }
 TEXT_OPTIONS = {"user_id", "role", "user_name", "docs", "exclude", "slice_type",
-                "cleanup", "upload_mode", "corpus_cache"}
+                "cleanup", "upload_mode", "corpus_cache", "mode", "judge_mode",
+                "judge_url", "judge_model", "answer_categories", "answer_seed"}
 BOOL_OPTIONS = {"offline", "strict_integrity", "public", "refresh_corpus",
                 "allow_negative_failure", "unique_marker"}
 CHOICES = {
     "slice_type": {"smart", "fixed", "paragraph"},
     "cleanup": {"keep", "delete", "delete-on-pass"},
     "upload_mode": {"sequential", "batch"},
+    "mode": {"retrieval", "chat", "both"},
+    "judge_mode": {"llm", "rules"},
 }
 DEFAULT_PARAMS: Dict[str, Any] = {
     "user_id": "1", "role": "admin", "user_name": "htknow-e2e-web",
@@ -78,6 +93,11 @@ DEFAULT_PARAMS: Dict[str, Any] = {
     "min_answer_in_context": 70, "min_keyword_coverage": 60,
     "max_p95_ms": 5000, "max_parse_ms": 0,
     "offline": False, "unique_marker": True,
+    "mode": "retrieval", "judge_mode": "llm", "answer_limit": 0, "answer_repeats": 1,
+    "answer_timeout": 310, "judge_timeout": 120,
+    "min_answer_correctness": 85, "min_answer_faithfulness": 95,
+    "min_citation_precision": 95, "min_citation_coverage": 90, "min_abstention_rate": 90,
+    "max_answer_p95_ms": 0, "max_first_text_ms": 0,
 }
 
 
@@ -184,11 +204,39 @@ class RunManager:
             return sum(1 for r in self.runs.values() if r.status == "running")
 
     def start(self, params: Dict[str, Any]) -> Run:
+        rejudge_source = None
+        if params.get("rejudge_of"):
+            rejudge_source = self.get(params["rejudge_of"])
+            if rejudge_source.status == "running" or not rejudge_source.report_json.exists():
+                raise ValueError("来源测试必须结束并生成 JSON 报告后才能重新评审")
+            if not json.loads(rejudge_source.report_json.read_text()).get("answers", {}).get("rows"):
+                raise ValueError("来源报告没有对话答案，无法重新评审")
+            params = dict(params, mode=rejudge_source.params.get("mode", "chat"))
         target = str(params.get("target") or "").strip()
         if not target:
             raise ValueError("必须填写目标地址 HOST:PORT")
-        if not TARGET_RE.match(target):
-            raise ValueError("目标地址只能包含字母、数字、. - : [ ]")
+        try:
+            parsed = urlparse(target if "://" in target else "http://" + target)
+            if (parsed.scheme not in ("http", "https") or parsed.username or parsed.password
+                    or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+                    or not TARGET_RE.fullmatch(parsed.netloc) or (parsed.port is not None and parsed.port <= 0)):
+                raise ValueError("invalid target")
+        except ValueError:
+            raise ValueError("目标地址须为 HOST:PORT 或 HTTP(S) 根地址，不能包含凭据、路径或查询参数") from None
+        if params.get("mode", "retrieval") != "retrieval":
+            from e2e_judge import Judge, JudgeError, judge_settings
+            try:
+                configured = Judge(params.get("judge_url"), params.get("judge_model"),
+                                   params.get("judge_timeout", 120), params.get("judge_mode", "llm"))
+                settings = judge_settings()
+                if settings["E2E_JUDGE_API_KEY"] and params.get("judge_url"):
+                    server_url = settings["E2E_JUDGE_URL"].rstrip("/")
+                    if server_url and not server_url.endswith("/chat/completions"):
+                        server_url += "/chat/completions"
+                    if configured.url != server_url:
+                        raise JudgeError("服务端已配置评审密钥；页面只能使用 E2E_JUDGE_URL 指定的接口，避免向其他地址发送密钥。")
+            except JudgeError as exc:
+                raise ValueError(str(exc)) from None
         with self.lock:
             if self.running_count() >= self.max_concurrent:
                 raise RuntimeError(f"已有 {self.max_concurrent} 个测试在运行，请等待完成或取消后再试")
@@ -196,6 +244,10 @@ class RunManager:
             run_dir = self.runs_dir / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             argv = build_argv(target, params, run_dir)
+            if rejudge_source:
+                argv += ["--rejudge-report", str(rejudge_source.report_json)]
+                if params.get("rejudge_errors_only"):
+                    argv += ["--rejudge-errors-only"]
             log_handle = run_dir.joinpath("console.log").open("wb")
             proc = subprocess.Popen([sys.executable, "-u", *argv], cwd=str(SCRIPT_DIR),
                                     stdout=log_handle, stderr=subprocess.STDOUT,
@@ -309,6 +361,7 @@ class RunManager:
         parse = report.get("parse") or {}
         latency = metrics.get("latency") or {}
         run.metrics = {
+            "mode": (report.get("config") or {}).get("mode", "retrieval"),
             "overall_pass": report.get("overall_pass"),
             "eval_k": metrics.get("eval_k"),
             "hit_rate": metrics.get("hit_rate"),
@@ -342,17 +395,25 @@ class RunManager:
                 for d in (report.get("documents") or [])
             ],
         }
+        if report.get("answers"):
+            answers = report["answers"]
+            run.metrics["answers"] = {"metrics": answers["metrics"], "semantic_status": answers["semantic_status"],
+                                      "judge": answers["judge"], "seed": answers["seed"],
+                                      "rows": [{key: row.get(key) for key in
+                                                ("case_id", "category", "repeat", "turn", "passed", "diagnosis")}
+                                               for row in answers["rows"]]}
 
 
 def build_argv(target: str, params: Dict[str, Any], run_dir: Path) -> List[str]:
     argv: List[str] = [str(TEST_SCRIPT), target,
                        "--report", str(run_dir / "report.html"),
                        "--json-report", str(run_dir / "report.json")]
-    for key in ("user_id", "role", "user_name", "docs", "exclude", "corpus_cache"):
+    for key in ("user_id", "role", "user_name", "docs", "exclude", "corpus_cache", "judge_url", "judge_model",
+                "answer_categories", "answer_seed"):
         value = params.get(key)
         if value:
             argv += [f"--{key.replace('_', '-')}", str(value)]
-    for key in ("slice_type", "cleanup", "upload_mode"):
+    for key in ("slice_type", "cleanup", "upload_mode", "mode", "judge_mode"):
         value = params.get(key)
         if value:
             argv += [f"--{key.replace('_', '-')}", str(value)]
@@ -413,6 +474,22 @@ def read_log(run: Run, offset: int, limit: int = 262144) -> Dict[str, Any]:
             text = text[: cut + 1]
     return {"offset": offset + len(text.encode("utf-8")), "chunk": text,
             "done": run.status != "running"}
+
+
+def read_report_html(run: Run) -> bytes:
+    """Use the current answer presentation for history without changing artifacts."""
+    original = run.report_html.read_bytes()
+    if not run.report_json.exists():
+        return original
+    try:
+        report = json.loads(run.report_json.read_text(encoding="utf-8"))
+        if isinstance(report, dict) and report.get("answers"):
+            from e2e_retrieval_test import render_html
+            return render_html(report).encode("utf-8")
+    except (OSError, ValueError, KeyError, TypeError):
+        # Older or incomplete artifacts remain readable in their saved format.
+        return original
+    return original
 
 
 CORPUS_PATH = SCRIPT_DIR / "e2e_corpus.json"
@@ -550,6 +627,19 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 4 and parts[3] == "cancel" and method == "POST":
                     self._send_json(200, MANAGER.cancel(run.id).summary())
                     return
+                if len(parts) == 4 and parts[3] == "rejudge" and method == "POST":
+                    raw = dict(run.params)
+                    overrides = self._read_json()
+                    errors_only = overrides.pop("errors_only", False)
+                    if type(errors_only) is not bool:
+                        raise ValueError("errors_only 必须是布尔值")
+                    raw.update(overrides)
+                    raw["target"] = run.target
+                    params = sanitize_params(raw)
+                    params["rejudge_of"] = run.id
+                    params["rejudge_errors_only"] = errors_only
+                    self._send_json(201, MANAGER.start(params).summary())
+                    return
                 if len(parts) == 4 and parts[3] == "log" and method == "GET":
                     offset = int((query.get("offset") or ["0"])[0])
                     self._send_json(200, read_log(run, max(0, offset)))
@@ -560,7 +650,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(404, "报告尚未生成（测试可能仍在运行）")
                     ctype = ("text/html; charset=utf-8" if parts[3] == "report"
                              else "application/json; charset=utf-8")
-                    self._send(200, target.read_bytes(), ctype)
+                    body = read_report_html(run) if parts[3] == "report" else target.read_bytes()
+                    self._send(200, body, ctype)
                     return
             raise ApiError(404, f"未知路径 {path}")
         except ApiError as exc:
@@ -601,7 +692,10 @@ def sanitize_params(raw: Dict[str, Any]) -> Dict[str, Any]:
     for key, (cast, lo, hi) in NUMERIC_OPTIONS.items():
         if key in raw and raw[key] not in (None, ""):
             try:
-                params[key] = max(lo, min(hi, cast(float(raw[key]))))
+                number = float(raw[key])
+                if not math.isfinite(number):
+                    raise ValueError("not finite")
+                params[key] = max(lo, min(hi, cast(number)))
             except (TypeError, ValueError):
                 raise ValueError(f"{key} 不是合法数字") from None
     for key in BOOL_OPTIONS:
@@ -610,521 +704,3018 @@ def sanitize_params(raw: Dict[str, Any]) -> Dict[str, Any]:
     return params
 
 
-UI_HTML = """<!DOCTYPE html>
+UI_HTML = r"""<!doctype html>
 <html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HTKnow 端到端检索测试控制台</title>
-<style>
-:root{--bg:#f4f6f9;--card:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;
---ok:#15803d;--okbg:#dcfce7;--bad:#b91c1c;--badbg:#fee2e2;--warn:#b45309;--warnbg:#fef3c7;
---na:#475569;--nabg:#e2e8f0;--accent:#2563eb;--accentbg:#dbeafe}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',Helvetica,Arial,sans-serif}
-header{background:linear-gradient(135deg,#0f172a,#1e3a8a);color:#fff;padding:16px 24px;
-display:flex;align-items:center;gap:16px;flex-wrap:wrap;box-shadow:0 4px 18px rgba(15,23,42,.18)}
-header h1{margin:0;font-size:18px;letter-spacing:.3px}
-header .sub{opacity:.8;font-size:12.5px}
-header .right{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:12.5px}
-header .chip{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);
-padding:3px 10px;border-radius:999px}
-main{max-width:1400px;margin:0 auto;padding:20px;display:grid;
-grid-template-columns:400px 1fr;gap:18px;align-items:start}
-@media (max-width:980px){main{grid-template-columns:1fr}}
-section{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:16px 18px;box-shadow:0 1px 2px rgba(15,23,42,.05)}
-section+section{margin-top:16px}
-h2{margin:0 0 10px;font-size:15px}
-h2 .hint{font-weight:400;color:var(--muted);font-size:12px;margin-left:6px}
-label{display:block;font-size:12.5px;color:#334155;margin:10px 0 4px}
-label .req{color:var(--bad)}
-input[type=text],input[type=number],select{width:100%;padding:7px 9px;border:1px solid var(--line);
-border-radius:8px;font:inherit;background:#fcfdff;color:var(--ink)}
-input:focus,select:focus{outline:2px solid var(--accentbg);border-color:var(--accent)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.check{display:flex;gap:8px;align-items:center;margin:10px 0 2px;font-size:13px;color:#334155}
-.check input{width:auto;margin:0}
-button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);
-background:#fff;padding:7px 14px;color:#334155}
-button:hover{background:#f8fafc}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-button.primary:hover{background:#1d4ed8}
-button.danger{background:#fff;border-color:#fecaca;color:var(--bad)}
-button.danger:hover{background:var(--badbg)}
-button:disabled{opacity:.5;cursor:not-allowed}
-details.adv{margin-top:12px;border:1px solid var(--line);border-radius:9px;padding:4px 12px 10px}
-details.adv>summary{cursor:pointer;font-size:12.5px;color:var(--muted);padding:6px 0;list-style:none}
-details.adv>summary::-webkit-details-marker{display:none}
-details.adv>summary::before{content:'▸ ';}
-details.adv[open]>summary::before{content:'▾ ';}
-.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11.5px;font-weight:600;
-border:1px solid transparent;white-space:nowrap}
-.badge.ok{color:var(--ok);background:var(--okbg);border-color:#bbf7d0}
-.badge.bad{color:var(--bad);background:var(--badbg);border-color:#fecaca}
-.badge.warn{color:var(--warn);background:var(--warnbg);border-color:#fde68a}
-.badge.na{color:var(--na);background:var(--nabg);border-color:#cbd5e1}
-.badge.run{color:#1d4ed8;background:var(--accentbg);border-color:#bfdbfe}
-.runhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-.runhead .target{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
-.runhead .meta{color:var(--muted);font-size:12px}
-.runhead .actions{margin-left:auto;display:flex;gap:8px}
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:10px 0 0}
-.tabs button{border:none;border-radius:8px 8px 0 0;background:transparent;padding:8px 14px;
-color:var(--muted);font-weight:600}
-.tabs button.active{color:var(--accent);background:var(--accentbg)}
-.pane{display:none;padding-top:12px}
-.pane.active{display:block}
-pre.log{background:#0b1220;color:#d7e3f4;border-radius:10px;padding:12px 14px;height:420px;
-overflow:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-white-space:pre-wrap;word-break:break-word;margin:0}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px}
-.card{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fcfdff}
-.card .k{color:var(--muted);font-size:11.5px;margin-bottom:3px}
-.card .v{font-size:19px;font-weight:700}
-.card .u{font-size:11px;color:var(--muted);font-weight:400;margin-left:2px}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{background:#f8fafc;color:#475569;font-weight:600;font-size:11.5px}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-td.c,th.c{text-align:center}
-tbody tr:nth-child(even){background:#fbfcfe}
-tbody tr.clickable{cursor:pointer}
-tbody tr.clickable:hover{background:var(--accentbg)}
-tbody tr.selected{background:var(--accentbg)}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
-.tbl-wrap{overflow-x:auto}
-#hist-table{font-size:11.5px;table-layout:fixed;width:100%}
-#hist-table th,#hist-table td{padding:5px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#hist-table th:nth-child(1),#hist-table td:nth-child(1){width:88px}
-#hist-table th:nth-child(2),#hist-table td:nth-child(2){width:108px}
-#hist-table th:nth-child(3),#hist-table td:nth-child(3){width:50px}
-#hist-table th:nth-child(4),#hist-table td:nth-child(4){width:52px}
-#hist-table th:nth-child(5),#hist-table td:nth-child(5){width:58px}
-.chip-doc{border:1px solid var(--line);background:#fcfdff;border-radius:999px;padding:1px 10px;
-font:inherit;font-size:11.5px;color:#475569;cursor:pointer;line-height:1.8}
-.chip-doc:hover{border-color:#bfdbfe;color:#1d4ed8;background:#f8fbff}
-.chip-doc.on{background:var(--accentbg);border-color:var(--accent);color:#1d4ed8;font-weight:600}
-.muted{color:var(--muted);font-size:12px}
-.callout{border-radius:9px;padding:9px 12px;margin:10px 0;font-size:12.5px;border:1px solid}
-.callout.bad{background:var(--badbg);border-color:#fecaca;color:#7f1d1d}
-.callout.warn{background:var(--warnbg);border-color:#fde68a;color:#78350f}
-.callout.ok{background:var(--okbg);border-color:#bbf7d0;color:#14532d}
-ul.tight{margin:6px 0 0;padding-left:18px}ul.tight li{margin:3px 0}
-iframe.report{width:100%;height:720px;border:1px solid var(--line);border-radius:10px;background:#fff}
-#toast{position:fixed;right:18px;bottom:18px;background:#0f172a;color:#fff;padding:10px 16px;
-border-radius:10px;font-size:13px;opacity:0;transform:translateY(8px);transition:.25s;
-pointer-events:none;max-width:420px;box-shadow:0 8px 24px rgba(15,23,42,.3);z-index:50}
-#toast.show{opacity:1;transform:none}
-#toast.err{background:#b91c1c}
-.spin{display:inline-block;width:10px;height:10px;border:2px solid #93c5fd;border-top-color:transparent;
-border-radius:50%;animation:sp 0.8s linear infinite;margin-right:6px;vertical-align:-1px}
-@keyframes sp{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
-<header>
-  <div>
-    <h1>HTKnow 端到端检索测试控制台</h1>
-    <div class="sub">建库 → 上传 → 解析 → 检索 → 指标评估 → 报告，全流程可视化</div>
-  </div>
-  <div class="right">
-    <span class="chip" id="info-concurrency">-</span>
-    <span class="chip" id="info-script">-</span>
-  </div>
-</header>
-<main>
-  <div>
-    <section>
-      <h2>发起测试</h2>
-      <label>目标地址 <span class="req">*</span></label>
-      <input type="text" id="f-target" placeholder="192.168.0.46:11000" autocomplete="off" spellcheck="false">
-      <div class="muted" style="margin-top:4px">HOST:PORT 形式；也接受 http://host:port</div>
-      <div class="row">
-        <div><label>切片方式</label>
-          <select id="f-slice_type"><option value="smart">smart 智能切片</option>
-          <option value="fixed">fixed 固定长度</option>
-          <option value="paragraph">paragraph 按段落</option></select></div>
-        <div><label>上传模式</label>
-          <select id="f-upload_mode"><option value="sequential">sequential 逐个等待</option>
-          <option value="batch">batch 先全传再等</option></select></div>
-      </div>
-      <div class="row">
-        <div><label>问题重复次数</label><input type="number" id="f-repeats" min="1" max="20" value="3"></div>
-        <div><label>评测 Top-K</label><input type="number" id="f-top_k" min="1" max="50" value="10"></div>
-      </div>
-      <div class="row">
-        <div><label>解析超时(秒)</label><input type="number" id="f-parse_timeout" min="10" value="1800"></div>
-        <div><label>知识库处置</label>
-          <select id="f-cleanup"><option value="delete-on-pass">通过即删</option>
-          <option value="keep">保留</option><option value="delete">总是删除</option></select></div>
-      </div>
-      <label class="check"><input type="checkbox" id="f-offline"> 离线模式（只用本地语料缓存，不联网下载）</label>
-      <details class="adv">
-        <summary>高级选项（认证 / 语料筛选 / 门禁阈值）</summary>
-        <div class="row">
-          <div><label>x-user-id</label><input type="text" id="f-user_id" value="1"></div>
-          <div><label>x-role</label><input type="text" id="f-role" value="admin"></div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f5" />
+    <title>HTKnow · 评测工作台</title>
+    <style>
+      :root {
+        --bg: #f6f7f5;
+        --card: #fff;
+        --ink: #252c29;
+        --muted: #687268;
+        --line: #e7eae6;
+        --accent: #26664c;
+        --accentbg: #edf5ef;
+        --ok: #26664c;
+        --okbg: #edf5ef;
+        --bad: #b34c42;
+        --badbg: #fbefec;
+        --warn: #946b26;
+        --warnbg: #fcf7e9;
+        --na: #737b76;
+        --nabg: #f0f2ef;
+        --radius: 12px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 24px;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font:
+          14px/1.6 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          "PingFang SC",
+          "Hiragino Sans GB",
+          "Microsoft YaHei",
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      a,
+      input,
+      select,
+      summary {
+        -webkit-tap-highlight-color: transparent;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      summary:focus-visible {
+        outline: 3px solid #a6cbb5;
+        outline-offset: 3px;
+      }
+      ::selection {
+        background: #dcecdf;
+      }
+      a {
+        color: var(--accent);
+      }
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+      button {
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--ink);
+        padding: 8px 13px;
+        border-radius: 7px;
+        transition:
+          background 0.15s,
+          border-color 0.15s;
+      }
+      button:hover:not(:disabled) {
+        background: #f3f5f1;
+        border-color: #cdd6cd;
+      }
+      button.primary {
+        color: #fff;
+        background: var(--accent);
+        border-color: var(--accent);
+        font-weight: 600;
+      }
+      button.primary:hover:not(:disabled) {
+        background: #1c513b;
+        border-color: #1c513b;
+      }
+      .danger {
+        color: var(--bad);
+      }
+      button.danger:hover:not(:disabled) {
+        background: var(--badbg);
+        border-color: #edc9c2;
+      }
+      .text-button {
+        border: 0;
+        background: transparent;
+        padding: 5px 0;
+        color: var(--accent);
+        font-size: 13px;
+      }
+      .text-button:hover:not(:disabled) {
+        background: transparent;
+        text-decoration: underline;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      .eyebrow {
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 1.6px;
+        line-height: 1.4;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      .topbar {
+        height: 72px;
+        background: #fff;
+        border-bottom: 1px solid var(--line);
+      }
+      .topbar-inner {
+        max-width: 1536px;
+        padding: 0 40px;
+        margin: auto;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .wordmark {
+        font-size: 23px;
+        letter-spacing: -1px;
+        font-weight: 750;
+      }
+      .brand-tag {
+        border-left: 1px solid #dce1db;
+        padding-left: 15px;
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.5px;
+      }
+      .topbar-right {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 24px;
+      }
+      .service-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .service-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #b7bcb8;
+        flex: none;
+      }
+      .service-status.ready .service-dot {
+        background: #538563;
+      }
+      .topbar .new-test {
+        padding: 7px 15px;
+        font-size: 12px;
+      }
+      .workspace {
+        max-width: 1536px;
+        margin: auto;
+        padding: 34px 40px 48px;
+      }
+      .page-intro {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 28px;
+      }
+      .breadcrumb {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+      .breadcrumb span {
+        padding: 0 9px;
+        color: #b9beb9;
+      }
+      .page-intro h1 {
+        font-size: 29px;
+        font-weight: 650;
+        letter-spacing: -0.8px;
+        line-height: 1.4;
+      }
+      .page-intro p {
+        color: var(--muted);
+        margin-top: 7px;
+        font-size: 13px;
+      }
+      .intro-note {
+        color: var(--muted);
+        font-size: 12px;
+        text-align: right;
+        white-space: nowrap;
+        padding-bottom: 3px;
+      }
+      .intro-note strong {
+        color: var(--ink);
+        font-weight: 600;
+        margin-right: 4px;
+      }
+      .workspace-grid {
+        display: grid;
+        grid-template-columns: 304px minmax(0, 1fr);
+        gap: 24px;
+        align-items: start;
+      }
+      .workspace-grid > * {
+        min-width: 0;
+      }
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+      }
+      .config-panel {
+        position: sticky;
+        top: 20px;
+        overflow: hidden;
+      }
+      .panel-heading {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 22px 22px 18px;
+      }
+      .panel-heading h2 {
+        font-size: 17px;
+        font-weight: 650;
+        line-height: 1.4;
+        margin-top: 5px;
+      }
+      .config-toggle {
+        display: none;
+      }
+      .config-body {
+        padding: 0 22px 18px;
+      }
+      .field {
+        margin-bottom: 17px;
+      }
+      .field:last-child {
+        margin-bottom: 0;
+      }
+      label,
+      .field-label {
+        display: block;
+        color: #505b53;
+        font-size: 12px;
+        font-weight: 500;
+        margin-bottom: 7px;
+      }
+      .req {
+        color: var(--accent);
+        margin-left: 3px;
+      }
+      .field-help {
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 6px;
+        line-height: 1.7;
+      }
+      input[type="text"],
+      input[type="number"],
+      input[type="url"],
+      input[type="search"],
+      select {
+        display: block;
+        width: 100%;
+        min-width: 0;
+        border: 1px solid #dfe4dd;
+        border-radius: 7px;
+        padding: 9px 11px;
+        line-height: 1.5;
+        background: #fff;
+        color: var(--ink);
+        transition:
+          border-color 0.15s,
+          box-shadow 0.15s;
+      }
+      input::placeholder {
+        color: #9aa29b;
+        opacity: 1;
+      }
+      input:focus,
+      select:focus {
+        outline: none;
+        border-color: #6e9c7d;
+        box-shadow: 0 0 0 3px #edf5ef;
+      }
+      input[type="number"] {
+        font-variant-numeric: tabular-nums;
+      }
+      select {
+        padding-right: 23px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      .row > div {
+        min-width: 0;
+      }
+      .check {
+        display: flex;
+        gap: 9px;
+        align-items: flex-start;
+        font-size: 12px;
+        font-weight: 400;
+        margin: 13px 0;
+        color: #5f6861;
+      }
+      .check input {
+        flex: none;
+        accent-color: var(--accent);
+        margin: 4px 0 0;
+        width: 14px;
+        height: 14px;
+      }
+      .mode-switch {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        padding: 4px;
+        background: #f0f3ee;
+        border-radius: 8px;
+        gap: 2px;
+      }
+      .mode-switch button {
+        border: 0;
+        background: transparent;
+        border-radius: 5px;
+        color: #778077;
+        font-size: 12px;
+        padding: 7px 0;
+        white-space: nowrap;
+      }
+      .mode-switch button[aria-pressed="true"] {
+        color: var(--accent);
+        background: #fff;
+        box-shadow: 0 1px 4px #23382612;
+        font-weight: 600;
+      }
+      .mode-description {
+        margin-top: 9px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.8;
+        min-height: 20px;
+      }
+      .config-separator {
+        border: 0;
+        border-top: 1px solid var(--line);
+        margin: 20px 0;
+      }
+      .adv {
+        border-top: 1px solid var(--line);
+        padding: 13px 0;
+      }
+      .adv > summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        color: #5e685f;
+        list-style-position: inside;
+      }
+      .adv > summary::marker {
+        font-size: 9px;
+        color: #9da79d;
+      }
+      .adv[open] > summary {
+        margin-bottom: 16px;
+        color: var(--ink);
+      }
+      .adv .field {
+        margin-bottom: 13px;
+      }
+      .adv .row {
+        margin-bottom: 13px;
+      }
+      .adv .field-help {
+        overflow-wrap: anywhere;
+      }
+      .answer-options {
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        margin-top: 18px;
+      }
+      .judge-status {
+        padding: 8px 10px;
+        background: #f5f8f3;
+        border-radius: 6px;
+        margin: 8px 0 14px;
+        color: #66816b;
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 9px;
+      }
+      .chip-doc {
+        padding: 3px 7px;
+        border-radius: 4px;
+        background: #f6f7f4;
+        color: #7c847b;
+        font-size: 10px;
+        max-width: 100%;
+        overflow-wrap: anywhere;
+      }
+      .chip-doc.on {
+        color: var(--accent);
+        border-color: #9ab9a3;
+        background: var(--accentbg);
+      }
+      .config-footer {
+        padding: 16px 22px 18px;
+        border-top: 1px solid var(--line);
+        background: #fcfdfb;
+      }
+      .config-footer .primary {
+        width: 100%;
+        padding: 11px;
+      }
+      .config-footer p {
+        font-size: 10px;
+        text-align: center;
+        color: #939c92;
+        margin-top: 8px;
+      }
+      .content-column {
+        min-width: 0;
+        display: grid;
+        gap: 20px;
+      }
+      .run-panel {
+        padding: 26px 28px 0;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .run-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .run-heading h2 {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.3px;
+        margin-top: 6px;
+        overflow-wrap: anywhere;
+        line-height: 1.5;
+      }
+      .run-meta {
+        font-size: 11px;
+        color: #899188;
+        margin-top: 5px;
+        overflow-wrap: anywhere;
+      }
+      .run-toolbar {
+        margin: 17px 0 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .run-date {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .actions {
+        display: flex;
+        gap: 7px;
+        flex-wrap: wrap;
+      }
+      .actions button {
+        font-size: 11px;
+        padding: 5px 10px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 8px;
+        border-radius: 5px;
+        font-size: 10px;
+        font-weight: 500;
+        line-height: 1.6;
+        white-space: nowrap;
+      }
+      .badge::before {
+        content: "";
+        height: 4px;
+        width: 4px;
+        flex: none;
+        background: currentColor;
+        border-radius: 50%;
+      }
+      .badge.ok {
+        color: var(--ok);
+        background: var(--okbg);
+      }
+      .badge.bad {
+        color: var(--bad);
+        background: var(--badbg);
+      }
+      .badge.warn {
+        color: var(--warn);
+        background: var(--warnbg);
+      }
+      .badge.na {
+        color: var(--na);
+        background: var(--nabg);
+      }
+      .badge.run {
+        color: var(--accent);
+        background: var(--accentbg);
+      }
+      .badge.run::before {
+        animation: pulse 1.5s ease infinite;
+      }
+      .run-heading > .badge {
+        padding: 5px 11px;
+        font-size: 12px;
+      }
+      .conclusion {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        justify-content: space-between;
+        border-radius: 8px;
+        background: #f3f5f0;
+        padding: 12px 15px;
+        margin-bottom: 20px;
+      }
+      .conclusion strong {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .conclusion p {
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 3px;
+        line-height: 1.7;
+      }
+      .conclusion.ok {
+        background: var(--okbg);
+      }
+      .conclusion.ok strong {
+        color: var(--ok);
+      }
+      .conclusion.bad {
+        background: var(--badbg);
+      }
+      .conclusion.bad strong {
+        color: var(--bad);
+      }
+      .conclusion.warn {
+        background: var(--warnbg);
+      }
+      .conclusion.warn strong {
+        color: var(--warn);
+      }
+      .gate-score {
+        white-space: nowrap;
+        font-size: 22px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -1px;
+        color: var(--accent);
+      }
+      .gate-score small {
+        font-size: 12px;
+        font-weight: 400;
+        color: var(--muted);
+        letter-spacing: 0;
+        margin-left: 3px;
+      }
+      .conclusion.bad .gate-score {
+        color: var(--bad);
+      }
+      .highlights {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin: 0 0 24px;
+        gap: 20px;
+      }
+      .highlight + .highlight {
+        border-left: 1px solid var(--line);
+        padding-left: 20px;
+      }
+      .highlight .k {
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 7px;
+      }
+      .highlight .v {
+        font-size: 27px;
+        font-weight: 600;
+        line-height: 1.2;
+        letter-spacing: -0.8px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .highlight .u {
+        font-size: 12px;
+        font-weight: 400;
+        letter-spacing: 0;
+        margin-left: 3px;
+        color: var(--muted);
+      }
+      .highlight .caption {
+        font-size: 10px;
+        color: #949b93;
+        margin-top: 6px;
+      }
+      .tabs {
+        display: flex;
+        gap: 27px;
+        border-bottom: 1px solid var(--line);
+        margin: 0;
+      }
+      .tabs button {
+        position: relative;
+        border: 0;
+        border-radius: 0;
+        padding: 12px 0;
+        background: transparent;
+        color: #899087;
+        font-size: 12px;
+        font-weight: 500;
+      }
+      .tabs button.active {
+        color: var(--accent);
+      }
+      .tabs button.active::after {
+        content: "";
+        position: absolute;
+        bottom: -1px;
+        height: 2px;
+        background: var(--accent);
+        left: 0;
+        right: 0;
+      }
+      .tabs button:hover:not(:disabled) {
+        background: transparent;
+        color: var(--ink);
+      }
+      .pane {
+        display: none;
+        padding: 24px 0;
+      }
+      .pane.active {
+        display: block;
+      }
+      .block-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .block-heading h2 {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .block-heading p {
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 3px;
+      }
+      .filter-button {
+        font-size: 10px;
+        padding: 5px 9px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .filter-button[aria-pressed="true"] {
+        color: var(--accent);
+        background: var(--accentbg);
+        border-color: #c5dacb;
+      }
+      .result-block + .result-block {
+        margin-top: 24px;
+      }
+      #m-answers:not(:empty) {
+        margin-top: 26px;
+      }
+      .tbl-wrap {
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      th,
+      td {
+        padding: 12px 10px;
+        border-bottom: 1px solid #edf0ea;
+        text-align: left;
+        vertical-align: middle;
+      }
+      th {
+        font-weight: 500;
+        font-size: 10px;
+        color: #939b91;
+        background: #f7f8f5;
+        white-space: nowrap;
+      }
+      th:first-child,
+      td:first-child {
+        padding-left: 13px;
+      }
+      td.num,
+      th.num {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      td.c,
+      th.c {
+        text-align: center;
+      }
+      tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      tbody tr:hover {
+        background: #fcfdfb;
+      }
+      .gate-name {
+        font-weight: 500;
+        white-space: nowrap;
+      }
+      .gate-note {
+        color: #747e70;
+        font-size: 11px;
+        max-width: 230px;
+        line-height: 1.7;
+      }
+      .gate-value {
+        font-weight: 600;
+      }
+      .gate-requirement {
+        color: #747e70;
+        font-size: 11px;
+      }
+      .gate-table {
+        min-width: 620px;
+      }
+      .details-block {
+        margin-top: 22px;
+        border-top: 1px solid var(--line);
+        padding-top: 17px;
+      }
+      .details-block > summary {
+        cursor: pointer;
+        font-size: 12px;
+        color: #65715f;
+        list-style-position: inside;
+      }
+      .details-block > summary::marker {
+        color: #a5aea0;
+        font-size: 9px;
+      }
+      .details-block > summary span {
+        font-size: 10px;
+        font-weight: 400;
+        color: #99a092;
+        margin-left: 8px;
+      }
+      .details-block[open] > summary {
+        margin-bottom: 16px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 18px 12px;
+        margin: 6px 0 4px;
+      }
+      .card .k {
+        font-size: 10px;
+        color: var(--muted);
+        margin-bottom: 5px;
+      }
+      .card .v {
+        font-size: 18px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.3px;
+      }
+      .card .u {
+        font-size: 10px;
+        color: var(--muted);
+        margin-left: 2px;
+        font-weight: 400;
+      }
+      .doc-table {
+        min-width: 640px;
+      }
+      .file-name {
+        font-size: 10px;
+        color: #8e978b;
+        max-width: 220px;
+        overflow-wrap: anywhere;
+        margin-top: 2px;
+      }
+      .answer-table {
+        min-width: 550px;
+      }
+      .answer-table .diagnosis {
+        font-size: 11px;
+        line-height: 1.8;
+        color: #7e8878;
+        min-width: 230px;
+      }
+      .answer-case {
+        font-weight: 600;
+      }
+      .callout {
+        padding: 12px 14px;
+        border-radius: 7px;
+        margin: 16px 0;
+        font-size: 11px;
+        line-height: 1.8;
+        overflow-wrap: anywhere;
+      }
+      .callout.bad {
+        background: var(--badbg);
+        color: var(--bad);
+      }
+      .callout.warn {
+        background: var(--warnbg);
+        color: var(--warn);
+      }
+      .callout > summary {
+        cursor: pointer;
+        font-weight: 500;
+      }
+      .callout ul {
+        padding-left: 16px;
+        margin: 8px 0 0;
+      }
+      .callout li + li {
+        margin-top: 5px;
+      }
+      .table-empty {
+        color: var(--muted);
+        text-align: center;
+        padding: 26px;
+        font-size: 12px;
+      }
+      .log-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .log-toolbar button {
+        font-size: 10px;
+        padding: 4px 8px;
+      }
+      pre.log {
+        background: #202923;
+        color: #c8d7c4;
+        border-radius: 8px;
+        padding: 20px;
+        height: 450px;
+        overflow: auto;
+        font:
+          11px/1.9 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        margin: 0;
+        tab-size: 2;
+      }
+      pre.log:empty::before {
+        content: "等待运行日志…";
+        color: #7b9279;
+      }
+      iframe.report {
+        width: 100%;
+        height: 760px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        display: block;
+      }
+      .history-panel {
+        overflow: hidden;
+      }
+      .history-heading {
+        padding: 22px 28px 16px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+      .history-heading h2 {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .history-heading h2 span {
+        font-size: 10px;
+        color: #929b8e;
+        font-weight: 400;
+        margin-left: 8px;
+      }
+      .history-heading input {
+        font-size: 11px;
+        padding: 7px 10px;
+        max-width: 190px;
+        background: #fafbf8;
+      }
+      .history-panel .tbl-wrap {
+        padding: 0 15px 10px;
+      }
+      .history-table {
+        min-width: 590px;
+      }
+      .history-table th {
+        background: #fff;
+      }
+      .history-table td {
+        font-size: 11px;
+        padding-top: 13px;
+        padding-bottom: 13px;
+      }
+      .history-table .selected {
+        background: #f0f6ee;
+      }
+      .history-table .clickable {
+        cursor: pointer;
+      }
+      .history-table .clickable:hover {
+        background: #f4f7f0;
+      }
+      .history-table .history-open {
+        font: inherit;
+        border: 0;
+        background: none;
+        padding: 0;
+        color: var(--ink);
+        text-align: left;
+        white-space: nowrap;
+      }
+      .history-table .history-open:hover {
+        background: none;
+        color: var(--accent);
+        text-decoration: underline;
+      }
+      .history-table .mono {
+        font-size: 11px;
+      }
+      .history-table .selected td:first-child {
+        box-shadow: inset 2px 0 var(--accent);
+      }
+      .history-time {
+        white-space: nowrap;
+        font-size: 10px;
+        color: #8f998a;
+      }
+      .mode-label {
+        color: #899381;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+      .empty-panel {
+        padding: 55px 40px 40px;
+      }
+      .empty-panel .eyebrow {
+        color: #91a38b;
+      }
+      .empty-panel h2 {
+        font-size: 26px;
+        font-weight: 550;
+        letter-spacing: -0.6px;
+        margin: 15px 0 12px;
+        line-height: 1.5;
+      }
+      .empty-panel > p {
+        font-size: 13px;
+        line-height: 1.9;
+        color: #8b9485;
+        max-width: 480px;
+      }
+      .empty-panel .text-button {
+        margin-top: 20px;
+      }
+      .empty-steps {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        list-style: none;
+        margin: 44px 0 0;
+        padding: 25px 0 0;
+        border-top: 1px solid var(--line);
+        gap: 25px;
+      }
+      .empty-steps .step-number {
+        color: #a4b09b;
+        font:
+          12px ui-monospace,
+          monospace;
+        margin-bottom: 12px;
+      }
+      .empty-steps h3 {
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 5px;
+      }
+      .empty-steps p {
+        font-size: 11px;
+        color: #939b8e;
+        line-height: 1.9;
+      }
+      .page-footer {
+        text-align: center;
+        padding-top: 28px;
+        color: #a2aa9b;
+        font-size: 10px;
+        letter-spacing: 0.2px;
+      }
+      #toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translate(-50%, 8px);
+        padding: 12px 20px;
+        background: #2b3a2e;
+        color: #fff;
+        border-radius: 8px;
+        font-size: 12px;
+        box-shadow: 0 4px 20px #2233221a;
+        max-width: min(480px, calc(100vw - 32px));
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity 0.2s,
+          transform 0.2s;
+        z-index: 50;
+      }
+      #toast.show {
+        opacity: 1;
+        transform: translate(-50%, 0);
+      }
+      #toast.err {
+        background: #8e493f;
+      }
+      @keyframes pulse {
+        50% {
+          opacity: 0.3;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+        *,
+        *::before,
+        *::after {
+          animation: none !important;
+          transition: none !important;
+        }
+      }
+      @media (min-width: 1600px) {
+        .workspace-grid {
+          grid-template-columns: 320px minmax(0, 1fr);
+        }
+      }
+      @media (max-width: 1100px) {
+        .topbar-inner {
+          padding: 0 24px;
+        }
+        .workspace {
+          padding: 28px 24px 40px;
+        }
+        .workspace-grid {
+          grid-template-columns: 280px minmax(0, 1fr);
+          gap: 18px;
+        }
+        .panel-heading {
+          padding: 20px 18px 16px;
+        }
+        .config-body {
+          padding: 0 18px 16px;
+        }
+        .config-footer {
+          padding: 15px 18px;
+        }
+        .run-panel {
+          padding: 22px 20px 0;
+        }
+        .history-heading {
+          padding: 20px 20px 14px;
+        }
+        .highlights {
+          gap: 12px;
+        }
+        .highlight + .highlight {
+          padding-left: 12px;
+        }
+        .highlight .v {
+          font-size: 23px;
+        }
+        .gate-note {
+          max-width: 160px;
+        }
+        .run-date {
+          font-size: 11px;
+        }
+        .run-toolbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+      @media (max-width: 820px) {
+        .topbar {
+          height: 62px;
+        }
+        .topbar-inner {
+          padding: 0 20px;
+          gap: 12px;
+        }
+        .wordmark {
+          font-size: 21px;
+        }
+        .brand-tag {
+          font-size: 10px;
+          padding-left: 12px;
+        }
+        .topbar-right {
+          gap: 12px;
+        }
+        .service-status {
+          font-size: 10px;
+        }
+        .topbar .new-test {
+          display: none;
+        }
+        .workspace {
+          padding: 25px 20px 32px;
+        }
+        .page-intro {
+          margin-bottom: 23px;
+          gap: 12px;
+        }
+        .page-intro h1 {
+          font-size: 26px;
+        }
+        .page-intro p {
+          font-size: 12px;
+          max-width: 290px;
+        }
+        .intro-note {
+          display: none;
+        }
+        .workspace-grid {
+          grid-template-columns: 1fr;
+          gap: 18px;
+        }
+        .config-panel {
+          position: static;
+        }
+        .config-toggle {
+          display: block;
+          font-size: 11px;
+          color: var(--accent);
+          padding: 5px 9px;
+          background: #f5f8f2;
+        }
+        .config-panel .panel-heading {
+          padding: 18px 20px;
+        }
+        .config-panel .eyebrow {
+          display: none;
+        }
+        .panel-heading h2 {
+          margin: 0;
+          font-size: 15px;
+        }
+        .config-body {
+          padding: 0 20px 16px;
+        }
+        .config-footer {
+          padding: 16px 20px;
+        }
+        .run-panel {
+          padding: 22px 20px 0;
+        }
+        .run-toolbar {
+          flex-direction: row;
+          align-items: center;
+          flex-wrap: wrap;
+        }
+        .run-heading h2 {
+          font-size: 18px;
+        }
+        .run-meta {
+          font-size: 10px;
+        }
+        .highlights {
+          gap: 14px;
+        }
+        .highlight .v {
+          font-size: 25px;
+        }
+        .highlight + .highlight {
+          padding-left: 14px;
+        }
+        .highlight .caption {
+          font-size: 9px;
+        }
+        .history-heading {
+          padding: 20px 20px 14px;
+        }
+        .empty-panel {
+          padding: 32px 25px;
+        }
+        .empty-panel h2 {
+          font-size: 23px;
+        }
+        .empty-steps {
+          gap: 18px;
+          margin-top: 30px;
+        }
+        .pane {
+          padding-top: 20px;
+        }
+        .page-footer {
+          font-size: 9px;
+        }
+      }
+      @media (max-width: 480px) {
+        .topbar-inner {
+          padding: 0 16px;
+        }
+        .brand {
+          gap: 10px;
+        }
+        .brand-tag {
+          padding-left: 10px;
+          font-size: 9px;
+        }
+        .service-status {
+          font-size: 9px;
+          gap: 5px;
+        }
+        .workspace {
+          padding: 22px 14px 28px;
+        }
+        .page-intro {
+          padding: 0 4px;
+        }
+        .breadcrumb {
+          font-size: 10px;
+        }
+        .page-intro h1 {
+          font-size: 25px;
+        }
+        .page-intro p {
+          font-size: 11px;
+        }
+        .run-panel {
+          padding: 21px 17px 0;
+        }
+        .run-heading h2 {
+          font-size: 16px;
+        }
+        .run-heading > .badge {
+          font-size: 10px;
+          padding: 4px 8px;
+        }
+        .run-date {
+          font-size: 10px;
+        }
+        .run-toolbar {
+          margin: 14px 0 16px;
+        }
+        .actions {
+          gap: 5px;
+        }
+        .actions button {
+          font-size: 10px;
+          padding: 5px 8px;
+        }
+        .conclusion {
+          padding: 11px 12px;
+          gap: 10px;
+          margin-bottom: 20px;
+        }
+        .conclusion strong {
+          font-size: 12px;
+        }
+        .conclusion p {
+          font-size: 10px;
+        }
+        .gate-score {
+          font-size: 20px;
+        }
+        .highlights {
+          grid-template-columns: 1fr 1fr;
+          gap: 18px 20px;
+          margin-bottom: 20px;
+        }
+        .highlight + .highlight {
+          border: 0;
+          padding-left: 0;
+        }
+        .highlight:nth-child(even) {
+          border-left: 1px solid var(--line);
+          padding-left: 20px;
+        }
+        .highlight .k {
+          font-size: 10px;
+          margin-bottom: 5px;
+        }
+        .highlight .v {
+          font-size: 25px;
+        }
+        .highlight .caption {
+          font-size: 9px;
+        }
+        .tabs {
+          gap: 25px;
+        }
+        .tabs button {
+          font-size: 11px;
+          padding: 11px 0;
+        }
+        .cards {
+          grid-template-columns: 1fr 1fr;
+        }
+        .history-heading {
+          gap: 10px;
+          padding: 18px 17px 12px;
+        }
+        .history-heading input {
+          max-width: 140px;
+          font-size: 10px;
+        }
+        .history-heading h2 {
+          font-size: 12px;
+        }
+        .history-heading h2 span {
+          font-size: 9px;
+          margin-left: 5px;
+        }
+        .history-panel .tbl-wrap {
+          padding: 0 10px 8px;
+        }
+        .block-heading h2 {
+          font-size: 13px;
+        }
+        .block-heading p {
+          font-size: 10px;
+        }
+        .filter-button {
+          font-size: 9px;
+          padding: 5px 7px;
+        }
+        .empty-panel {
+          padding: 30px 23px;
+        }
+        .empty-panel h2 {
+          font-size: 22px;
+        }
+        .empty-steps {
+          gap: 16px;
+          grid-template-columns: 1fr;
+          margin-top: 28px;
+          padding-top: 22px;
+        }
+        .empty-steps li {
+          display: grid;
+          grid-template-columns: 25px 1fr;
+          column-gap: 14px;
+        }
+        .empty-steps .step-number {
+          grid-row: 1/3;
+          margin: 0;
+          padding-top: 1px;
+        }
+        .empty-steps h3 {
+          margin-bottom: 3px;
+        }
+        .empty-steps p {
+          grid-column: 2;
+        }
+        .pane {
+          padding-bottom: 20px;
+        }
+        pre.log {
+          height: 380px;
+          padding: 14px;
+          font-size: 10px;
+        }
+        iframe.report {
+          height: 640px;
+        }
+        .row {
+          gap: 12px;
+        }
+        input[type="text"],
+        input[type="url"],
+        input[type="number"],
+        input[type="search"],
+        select {
+          font-size: 16px;
+        }
+        input[type="search"] {
+          font-size: 12px;
+        }
+        .history-heading input {
+          font-size: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="HTKnow 评测工作台首页"
+          ><span class="wordmark">HTKnow</span
+          ><span class="brand-tag">EVALUATION</span></a
+        >
+        <div class="topbar-right">
+          <span class="service-status" id="service-status"
+            ><span class="service-dot" aria-hidden="true"></span
+            ><span id="info-concurrency">连接中</span></span
+          ><span id="info-script" hidden>检索与对话评估</span
+          ><button class="new-test" id="btn-new">新建评测</button>
         </div>
-        <label>只测文档（逗号分隔，留空=全部）</label>
-        <input type="text" id="f-docs" placeholder="art_of_war,needle_synthetic">
-        <div class="chips" id="doc-chips"></div>
-        <label>排除文档（逗号分隔）</label>
-        <input type="text" id="f-exclude" placeholder="calibre_docx_demo">
-        <div class="row">
-          <div><label>Hit@K 下限 %</label><input type="number" id="f-min_hit_rate" value="80" step="1"></div>
-          <div><label>MRR 下限</label><input type="number" id="f-min_mrr" value="0.6" step="0.05"></div>
+      </div>
+    </header>
+    <main class="workspace">
+      <div class="page-intro">
+        <div>
+          <div class="breadcrumb">工作空间<span>/</span>质量评测</div>
+          <h1>评测工作台</h1>
+          <p>从检索命中到答案可信度，让质量变化清晰可见。</p>
         </div>
-        <div class="row">
-          <div><label>nDCG 下限</label><input type="number" id="f-min_ndcg" value="0.4" step="0.05"></div>
-          <div><label>答案在上下文 %</label><input type="number" id="f-min_answer_in_context" value="70" step="1"></div>
+        <div class="intro-note">
+          <div><strong id="overview-count">—</strong>次评测已记录</div>
+          <div id="overview-latest">建立你的质量基线</div>
         </div>
-        <div class="row">
-          <div><label>解析成功率 %</label><input type="number" id="f-min_parse_success" value="100" step="1"></div>
-          <div><label>检索 P95 上限 ms</label><input type="number" id="f-max_p95_ms" value="5000" step="100"></div>
+      </div>
+      <div class="workspace-grid">
+        <aside
+          class="panel config-panel"
+          id="config-panel"
+          aria-label="新建评测配置"
+        >
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">CONFIGURATION</p>
+              <h2>新建评测</h2>
+            </div>
+            <button
+              class="config-toggle"
+              id="btn-config"
+              aria-expanded="true"
+              aria-controls="form-content"
+            >
+              收起配置
+            </button>
+          </div>
+          <div id="form-content">
+            <div class="config-body">
+              <div class="field">
+                <span class="field-label" id="mode-label">评测模式</span>
+                <div
+                  class="mode-switch"
+                  role="group"
+                  aria-labelledby="mode-label"
+                >
+                  <button
+                    type="button"
+                    data-mode="retrieval"
+                    aria-pressed="true"
+                  >
+                    仅检索</button
+                  ><button type="button" data-mode="chat" aria-pressed="false">
+                    对话答案</button
+                  ><button type="button" data-mode="both" aria-pressed="false">
+                    完整链路
+                  </button>
+                </div>
+                <label class="sr-only" for="f-mode">评测模式</label
+                ><select
+                  id="f-mode"
+                  class="sr-only"
+                  tabindex="-1"
+                  aria-hidden="true"
+                >
+                  <option value="retrieval">仅检索</option>
+                  <option value="chat">对话答案</option>
+                  <option value="both">完整链路：检索 + 对话答案</option>
+                </select>
+                <p class="mode-description" id="mode-description">
+                  验证文档解析、检索命中与排序质量。
+                </p>
+              </div>
+              <div class="field">
+                <label for="f-target"
+                  >目标服务地址<span class="req">*</span></label
+                ><input
+                  type="text"
+                  id="f-target"
+                  placeholder="192.168.0.46:11000"
+                  autocomplete="off"
+                  spellcheck="false"
+                  required
+                  aria-describedby="target-help"
+                />
+                <p class="field-help" id="target-help">
+                  输入 HOST:PORT 或完整的 HTTP(S) 地址
+                </p>
+              </div>
+              <div class="row" id="retrieval-options">
+                <div class="field">
+                  <label for="f-repeats">问题重复次数</label
+                  ><input
+                    type="number"
+                    id="f-repeats"
+                    min="1"
+                    max="20"
+                    value="3"
+                  />
+                </div>
+                <div class="field">
+                  <label for="f-top_k">检索 Top-K</label
+                  ><input
+                    type="number"
+                    id="f-top_k"
+                    min="1"
+                    max="50"
+                    value="10"
+                  />
+                </div>
+              </div>
+              <div
+                id="answer-options"
+                class="answer-options"
+                style="display: none"
+              >
+                <div class="field">
+                  <label for="f-judge_mode">答案评审方式</label
+                  ><select id="f-judge_mode">
+                    <option value="llm">独立模型语义评审</option>
+                    <option value="rules">仅规则检查（语义未评估）</option>
+                  </select>
+                  <div class="judge-status" id="judge-status">
+                    正在读取评审配置…
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="field">
+                    <label for="f-answer_limit">用例上限</label
+                    ><input
+                      type="number"
+                      id="f-answer_limit"
+                      min="0"
+                      max="500"
+                      value="0"
+                    />
+                    <p class="field-help">0 表示全部 60 个用例</p>
+                  </div>
+                  <div class="field">
+                    <label for="f-answer_repeats">每用例重复次数</label
+                    ><input
+                      type="number"
+                      id="f-answer_repeats"
+                      min="1"
+                      max="20"
+                      value="1"
+                    />
+                  </div>
+                </div>
+                <details class="adv">
+                  <summary>自定义评审与用例</summary>
+                  <div class="field">
+                    <label for="f-answer_categories">用例分类</label
+                    ><input
+                      type="text"
+                      id="f-answer_categories"
+                      placeholder="facts,multi_turn"
+                    />
+                    <p class="field-help">
+                      留空评测全部分类；多个分类用逗号分隔
+                    </p>
+                  </div>
+                  <div class="field">
+                    <label for="f-judge_url">独立评审接口</label
+                    ><input
+                      type="url"
+                      id="f-judge_url"
+                      placeholder="https://provider.example/v1"
+                      autocomplete="off"
+                    />
+                    <p class="field-help">留空使用服务端已配置的接口</p>
+                  </div>
+                  <div class="field">
+                    <label for="f-judge_model">评审模型</label
+                    ><input
+                      type="text"
+                      id="f-judge_model"
+                      placeholder="使用服务端配置"
+                      autocomplete="off"
+                    />
+                  </div>
+                  <div class="field">
+                    <label for="f-answer_seed">合成事实种子</label
+                    ><input
+                      type="text"
+                      id="f-answer_seed"
+                      placeholder="留空每次生成新事实"
+                      autocomplete="off"
+                    />
+                  </div>
+                  <p class="field-help">仅规则检查会保留“语义未评估”状态。</p>
+                </details>
+              </div>
+              <details class="adv">
+                <summary>运行设置</summary>
+                <div class="row">
+                  <div>
+                    <label for="f-slice_type">切片方式</label
+                    ><select id="f-slice_type">
+                      <option value="smart">智能切片</option>
+                      <option value="fixed">固定长度</option>
+                      <option value="paragraph">按段落</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="f-upload_mode">上传模式</label
+                    ><select id="f-upload_mode">
+                      <option value="sequential">逐个等待</option>
+                      <option value="batch">批量上传</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="row">
+                  <div>
+                    <label for="f-parse_timeout">解析超时 / 秒</label
+                    ><input
+                      type="number"
+                      id="f-parse_timeout"
+                      min="10"
+                      value="1800"
+                    />
+                  </div>
+                  <div>
+                    <label for="f-cleanup">测试后知识库</label
+                    ><select id="f-cleanup">
+                      <option value="delete-on-pass">通过后删除</option>
+                      <option value="keep">保留</option>
+                      <option value="delete">始终删除</option>
+                    </select>
+                  </div>
+                </div>
+                <label class="check"
+                  ><input type="checkbox" id="f-offline" /><span
+                    >离线模式，仅使用本地语料缓存</span
+                  ></label
+                >
+              </details>
+              <details class="adv">
+                <summary>语料与权限</summary>
+                <div class="field">
+                  <label for="f-docs">指定评测文档</label
+                  ><input
+                    type="text"
+                    id="f-docs"
+                    placeholder="留空使用全部文档"
+                  />
+                  <p class="field-help">
+                    点击选择文档，或输入以逗号分隔的文档 ID
+                  </p>
+                  <div class="chips" id="doc-chips"></div>
+                </div>
+                <div class="field">
+                  <label for="f-exclude">排除文档</label
+                  ><input
+                    type="text"
+                    id="f-exclude"
+                    placeholder="calibre_docx_demo"
+                  />
+                </div>
+                <div class="row">
+                  <div>
+                    <label for="f-user_id">用户 ID</label
+                    ><input type="text" id="f-user_id" value="1" />
+                  </div>
+                  <div>
+                    <label for="f-role">角色</label
+                    ><input type="text" id="f-role" value="admin" />
+                  </div>
+                </div>
+                <label class="check"
+                  ><input type="checkbox" id="f-public" /><span
+                    >创建公开知识库</span
+                  ></label
+                ><label class="check"
+                  ><input type="checkbox" id="f-strict_integrity" /><span
+                    >语料校验不一致即失败</span
+                  ></label
+                >
+              </details>
+              <details class="adv">
+                <summary>检索验收门禁</summary>
+                <div class="row">
+                  <div>
+                    <label for="f-min_hit_rate">Hit@K 下限 / %</label
+                    ><input
+                      type="number"
+                      id="f-min_hit_rate"
+                      value="80"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                  </div>
+                  <div>
+                    <label for="f-min_mrr">MRR 下限</label
+                    ><input
+                      type="number"
+                      id="f-min_mrr"
+                      value="0.6"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                    />
+                  </div>
+                </div>
+                <div class="row">
+                  <div>
+                    <label for="f-min_ndcg">nDCG 下限</label
+                    ><input
+                      type="number"
+                      id="f-min_ndcg"
+                      value="0.4"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                    />
+                  </div>
+                  <div>
+                    <label for="f-min_answer_in_context">上下文命中 / %</label
+                    ><input
+                      type="number"
+                      id="f-min_answer_in_context"
+                      value="70"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                  </div>
+                </div>
+                <div class="row">
+                  <div>
+                    <label for="f-min_parse_success">解析成功率 / %</label
+                    ><input
+                      type="number"
+                      id="f-min_parse_success"
+                      value="100"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                  </div>
+                  <div>
+                    <label for="f-max_p95_ms">检索 P95 / ms</label
+                    ><input
+                      type="number"
+                      id="f-max_p95_ms"
+                      value="5000"
+                      min="0"
+                      step="100"
+                    />
+                  </div>
+                </div>
+                <label class="check"
+                  ><input type="checkbox" id="f-allow_negative_failure" /><span
+                    >负样本泄漏仅告警</span
+                  ></label
+                >
+              </details>
+            </div>
+            <div class="config-footer">
+              <button class="primary" id="btn-start">开始评测</button>
+              <p>自动执行测试，生成可追溯的评测报告</p>
+            </div>
+          </div>
+        </aside>
+        <div class="content-column">
+          <section
+            class="panel run-panel"
+            id="run-section"
+            style="display: none"
+            aria-label="评测结果"
+            tabindex="-1"
+          >
+            <div class="run-heading">
+              <div>
+                <p class="eyebrow" id="r-kind">评测结果</p>
+                <h2 id="r-target">—</h2>
+              </div>
+              <span class="badge na" id="r-status" role="status">—</span>
+            </div>
+            <p class="run-meta mono" id="r-meta">—</p>
+            <div class="run-toolbar">
+              <span class="run-date" id="r-date">—</span>
+              <div class="actions">
+                <button id="btn-cancel" class="danger">取消运行</button
+                ><button id="btn-json" disabled>下载 JSON</button
+                ><button id="btn-report" disabled>打开完整报告</button>
+              </div>
+            </div>
+            <div id="r-summary" aria-live="polite"></div>
+            <div class="highlights" id="r-highlights"></div>
+            <div id="r-warn"></div>
+            <div class="tabs" role="tablist" aria-label="运行详情">
+              <button
+                id="tab-metrics"
+                role="tab"
+                data-tab="metrics"
+                aria-controls="pane-metrics"
+                aria-selected="false"
+                tabindex="-1"
+              >
+                指标与门禁</button
+              ><button
+                id="tab-log"
+                role="tab"
+                data-tab="log"
+                class="active"
+                aria-controls="pane-log"
+                aria-selected="true"
+              >
+                运行日志</button
+              ><button
+                id="tab-report"
+                role="tab"
+                data-tab="report"
+                aria-controls="pane-report"
+                aria-selected="false"
+                tabindex="-1"
+              >
+                完整报告
+              </button>
+            </div>
+            <div
+              class="pane active"
+              id="pane-log"
+              role="tabpanel"
+              aria-labelledby="tab-log"
+            >
+              <div class="log-toolbar">
+                <span id="log-status">实时输出 · 自动滚动至最新</span
+                ><button id="btn-log-bottom">回到最新</button>
+              </div>
+              <pre
+                class="log"
+                id="log"
+                tabindex="0"
+                aria-label="运行日志"
+              ></pre>
+            </div>
+            <div
+              class="pane"
+              id="pane-metrics"
+              role="tabpanel"
+              aria-labelledby="tab-metrics"
+            >
+              <div id="m-gates"></div>
+              <div id="m-answers"></div>
+              <details class="details-block" id="all-metrics">
+                <summary>
+                  全部质量与性能指标<span>展开查看详细数值</span>
+                </summary>
+                <div class="cards" id="m-cards"></div>
+              </details>
+              <div id="m-docs"></div>
+              <div id="m-hints"></div>
+            </div>
+            <div
+              class="pane"
+              id="pane-report"
+              role="tabpanel"
+              aria-labelledby="tab-report"
+            >
+              <iframe
+                class="report"
+                id="report-frame"
+                title="完整评测报告"
+                src="about:blank"
+              ></iframe>
+            </div>
+          </section>
+          <section class="panel empty-panel" id="empty-section">
+            <p class="eyebrow">YOUR QUALITY BASELINE</p>
+            <h2>从一次评测，<br />了解知识库的回答质量。</h2>
+            <p>
+              选择目标服务和评测模式，自动验证检索质量与答案可信度。每一次运行都有据可查。
+            </p>
+            <button class="text-button" id="btn-empty-start">
+              填写目标地址，开始评测
+            </button>
+            <ol class="empty-steps">
+              <li>
+                <div class="step-number">01</div>
+                <h3>配置目标</h3>
+                <p>选择服务地址与评测范围</p>
+              </li>
+              <li>
+                <div class="step-number">02</div>
+                <h3>自动执行</h3>
+                <p>建库、解析、检索与答案评审</p>
+              </li>
+              <li>
+                <div class="step-number">03</div>
+                <h3>定位问题</h3>
+                <p>查看指标、证据与逐题诊断</p>
+              </li>
+            </ol>
+          </section>
+          <section class="panel history-panel" aria-label="历史运行">
+            <div class="history-heading">
+              <h2>运行记录<span id="hist-count">—</span></h2>
+              <label for="hist-search" class="sr-only">搜索运行记录</label
+              ><input
+                id="hist-search"
+                type="search"
+                placeholder="搜索目标或运行 ID"
+                autocomplete="off"
+              />
+            </div>
+            <div class="tbl-wrap">
+              <table class="history-table" id="hist-table">
+                <thead>
+                  <tr>
+                    <th>目标 / 开始时间</th>
+                    <th>评测模式</th>
+                    <th>状态</th>
+                    <th class="num">质量</th>
+                    <th class="num">P95 耗时</th>
+                  </tr>
+                </thead>
+                <tbody id="hist-body">
+                  <tr>
+                    <td colspan="5" class="table-empty">正在读取运行记录…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
         </div>
-        <label class="check"><input type="checkbox" id="f-public"> 创建公开知识库</label>
-        <label class="check"><input type="checkbox" id="f-strict_integrity"> SHA-256 不匹配即失败</label>
-        <label class="check"><input type="checkbox" id="f-allow_negative_failure"> 负样本泄漏仅告警</label>
-      </details>
-      <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="primary" id="btn-start" style="flex:1">开始测试</button>
       </div>
-    </section>
-    <section>
-      <h2>历史运行 <span class="hint" id="hist-count"></span></h2>
-      <div class="tbl-wrap"><table id="hist-table"><thead><tr><th>开始时间</th><th>目标</th><th class="c">状态</th>
-      <th class="num">Hit@K</th><th class="num">P95</th></tr></thead>
-      <tbody id="hist-body"></tbody></table></div>
-    </section>
-  </div>
-  <div>
-    <section id="run-section" style="display:none">
-      <div class="runhead">
-        <span class="badge na" id="r-status">-</span>
-        <span class="target" id="r-target">-</span>
-        <span class="meta" id="r-meta">-</span>
-        <span class="actions">
-          <button id="btn-cancel" class="danger">取消</button>
-          <button id="btn-report" disabled>打开报告</button>
-          <button id="btn-json" disabled>下载 JSON</button>
-        </span>
-      </div>
-      <div id="r-warn"></div>
-      <div class="tabs">
-        <button data-tab="log" class="active">实时日志</button>
-        <button data-tab="metrics">门禁与指标</button>
-        <button data-tab="report">报告</button>
-      </div>
-      <div class="pane active" id="pane-log"><pre class="log" id="log"></pre></div>
-      <div class="pane" id="pane-metrics">
-        <div class="cards" id="m-cards"></div>
-        <div id="m-gates"></div>
-        <div id="m-docs"></div>
-        <div id="m-hints"></div>
-      </div>
-      <div class="pane" id="pane-report"><iframe class="report" id="report-frame" src="about:blank"></iframe></div>
-    </section>
-    <section id="empty-section">
-      <h2>还没有运行</h2>
-      <p class="muted">在左侧填写目标地址（例如 <span class="mono">192.168.0.46:11000</span>）后点击「开始测试」。
-      测试会在目标部署上创建一次性知识库、上传公开评测语料、等待解析并执行带 ground truth 的检索评估，
-      结束后生成自包含 HTML 报告。历史运行会保留在下方列表中。</p>
-    </section>
-  </div>
-</main>
-<div id="toast"></div>
-<script>
-'use strict';
-var $ = function(s){ return document.querySelector(s); };
-var currentRun = null, logOffset = 0, logTimer = null, listTimer = null, lastDone = null;
-
-function toast(msg, isErr){
-  var el = $('#toast');
-  el.textContent = msg;
-  el.className = 'show' + (isErr ? ' err' : '');
-  clearTimeout(el._t);
-  el._t = setTimeout(function(){ el.className = ''; }, 4200);
-}
-function api(path, opts){
-  return fetch(path, opts).then(function(r){
-    return r.json().then(function(j){
-      if(!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-      return j;
-    });
-  });
-}
-function esc(s){
-  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-  });
-}
-function fmtMs(v){
-  if(v == null) return '-';
-  if(v < 1000) return Math.round(v) + ' ms';
-  if(v < 60000) return (v/1000).toFixed(2) + ' s';
-  return Math.floor(v/60000) + 'm' + Math.round((v%60000)/1000) + 's';
-}
-function fmtNum(v, d){ return v == null ? '-' : Number(v).toFixed(d == null ? 1 : d); }
-function statusBadge(s){
-  var map = {running:'run', pass:'ok', fail:'bad', error:'bad', canceled:'warn', interrupted:'warn'};
-  var label = {running:'运行中', pass:'通过', fail:'未达标', error:'异常', canceled:'已取消', interrupted:'已中断'};
-  return '<span class="badge ' + (map[s]||'na') + '">' + (label[s]||s) + '</span>';
-}
-
-function collectParams(){
-  var p = { target: $('#f-target').value.trim() };
-  ['slice_type','upload_mode','cleanup','user_id','role','docs','exclude'].forEach(function(k){
-    var v = $('#f-' + k).value.trim();
-    if(v) p[k] = v;
-  });
-  ['repeats','top_k','parse_timeout','min_hit_rate','min_mrr','min_ndcg',
-   'min_answer_in_context','min_parse_success','max_p95_ms'].forEach(function(k){
-    var v = $('#f-' + k).value;
-    if(v !== '') p[k] = Number(v);
-  });
-  ['offline','public','strict_integrity','allow_negative_failure'].forEach(function(k){
-    p[k] = $('#f-' + k).checked;
-  });
-  return p;
-}
-
-function startRun(){
-  var p = collectParams();
-  if(!p.target){ toast('请先填写目标地址', true); $('#f-target').focus(); return; }
-  $('#btn-start').disabled = true;
-  api('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify(p)})
-    .then(function(run){
-      toast('已启动测试 ' + run.id);
-      selectRun(run.id);
-      refreshList();
-    })
-    .catch(function(e){ toast(e.message, true); })
-    .then(function(){ $('#btn-start').disabled = false; });
-}
-
-function cancelRun(){
-  if(!currentRun) return;
-  api('/api/runs/' + currentRun + '/cancel', {method:'POST'})
-    .then(function(){ toast('已取消'); pollOnce(true); refreshList(); })
-    .catch(function(e){ toast(e.message, true); });
-}
-
-function selectRun(id){
-  currentRun = id; logOffset = 0; lastDone = null;
-  $('#log').textContent = '';
-  $('#run-section').style.display = '';
-  $('#empty-section').style.display = 'none';
-  $('#report-frame').src = 'about:blank';
-  switchTab('log');
-  pollOnce(true);
-  if(logTimer) clearInterval(logTimer);
-  logTimer = setInterval(function(){ pollOnce(false); }, 900);
-  refreshList();
-}
-
-function pollOnce(force){
-  if(!currentRun) return;
-  api('/api/runs/' + currentRun + '/log?offset=' + logOffset).then(function(d){
-    logOffset = d.offset;
-    if(d.chunk){
-      var el = $('#log');
-      var near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-      el.textContent += d.chunk;
-      if(near) el.scrollTop = el.scrollHeight;
-    }
-    return api('/api/runs/' + currentRun);
-  }).then(function(run){
-    renderRun(run);
-    if(run.status !== 'running' && lastDone !== run.id){
-      lastDone = run.id;
-      renderMetrics(run);
-      refreshList();
-      if(run.status === 'pass') toast('测试完成：全部关键门禁达标');
-      else if(run.status === 'fail') toast('测试完成：存在未达标门禁', true);
-      else if(run.status === 'error') toast('测试异常结束：' + (run.error||''), true);
-    }
-    if(force) renderMetrics(run);
-  }).catch(function(e){ /* 网络抖动时静默重试 */ });
-}
-
-function renderRun(run){
-  $('#r-status').outerHTML = statusBadge(run.status).replace('class="badge', 'id="r-status" class="badge');
-  $('#r-target').textContent = run.target;
-  var bits = [run.id, '已用时 ' + run.elapsed_s + 's'];
-  if(run.pid) bits.push('pid ' + run.pid);
-  var metaEl = $('#r-meta');
-  metaEl.textContent = bits.join(' · ');
-  metaEl.title = run.command ? '等效命令行（可直接复制到终端重跑）：\\n' + run.command : '';
-  $('#btn-cancel').disabled = run.status !== 'running';
-  $('#btn-report').disabled = !run.has_report;
-  $('#btn-json').disabled = !run.has_json;
-  var warn = '';
-  if(run.error) warn = '<div class="callout bad">' + esc(run.error) + '</div>';
-  else if(run.metrics && run.metrics.warnings && run.metrics.warnings.length){
-    warn = '<div class="callout warn"><strong>运行告警</strong><ul class="tight">' +
-      run.metrics.warnings.map(function(w){ return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></div>';
-  }
-  $('#r-warn').innerHTML = warn;
-}
-
-function renderMetrics(run){
-  var m = run.metrics;
-  if(!m){
-    $('#m-cards').innerHTML = '';
-    $('#m-gates').innerHTML = run.status === 'running'
-      ? '<p class="muted">测试进行中，指标将在结束后展示。可先查看实时日志。</p>'
-      : '<div class="callout bad">未生成指标（测试可能未跑到评估阶段），请查看日志与告警。</div>';
-    $('#m-docs').innerHTML = ''; $('#m-hints').innerHTML = '';
-    return;
-  }
-  var cards = [
-    ['总体结论', m.overall_pass ? 'PASS' : 'FAIL', ''],
-    ['Hit@' + (m.eval_k||'-'), fmtNum(m.hit_rate), '%'],
-    ['MRR', fmtNum(m.mrr, 3), ''],
-    ['nDCG', fmtNum(m.ndcg, 3), ''],
-    ['答案在上下文', fmtNum(m.answer_in_context), '%'],
-    ['负样本通过率', fmtNum(m.negative_pass_rate, 0), '%'],
-    ['解析成功率', fmtNum(m.parse_success_rate), '%'],
-    ['检索 P95', fmtMs(m.search_p95_ms), ''],
-    ['解析 P95', fmtMs(m.parse_p95_ms), ''],
-    ['切片总数', m.total_slices == null ? '-' : m.total_slices, '']
-  ];
-  $('#m-cards').innerHTML = cards.map(function(c){
-    return '<div class="card"><div class="k">' + esc(c[0]) + '</div><div class="v">' +
-      esc(c[1]) + '<span class="u">' + esc(c[2]) + '</span></div></div>';
-  }).join('');
-  var gates = (m.gates || []).map(function(g){
-    var unit = g.unit === 'ms' ? fmtMs(g.actual) : (g.unit === '%' ? fmtNum(g.actual) + '%' : fmtNum(g.actual, 3));
-    var th = g.threshold == null ? '未启用' : (g.unit === 'ms' ? fmtMs(g.threshold)
-      : (g.unit === '%' ? fmtNum(g.threshold) + '%' : fmtNum(g.threshold, 3)));
-    var st = g.threshold == null || g.actual == null ? '<span class="badge na">未启用</span>'
-      : (g.passed ? '<span class="badge ok">通过</span>' : '<span class="badge bad">未通过</span>');
-    return '<tr><td>' + esc(g.name) + '</td><td class="mono">' + esc(g.metric) + '</td>' +
-      '<td class="num">' + esc(unit) + '</td><td class="c mono">' + esc(g.comparator) + '</td>' +
-      '<td class="num">' + esc(th) + '</td><td class="c">' + st + '</td>' +
-      '<td class="muted">' + esc(g.note || '') + '</td></tr>';
-  }).join('');
-  $('#m-gates').innerHTML = '<h2 style="margin-top:6px">验收门禁</h2><table><thead><tr>' +
-    '<th>门禁项</th><th>指标</th><th class="num">实测</th><th class="c">要求</th>' +
-    '<th class="num">阈值</th><th class="c">结果</th><th>备注</th></tr></thead><tbody>' +
-    gates + '</tbody></table>';
-  var docs = (m.documents || []).map(function(d){
-    var stageMap = {completed:['ok','解析完成'], skipped:['warn','跳过'], parse_failed:['bad','解析失败'],
-      parse_timeout:['bad','超时'], upload_failed:['bad','上传失败'], download_failed:['bad','语料获取失败']};
-    var st = stageMap[d.stage] || ['na', d.stage];
-    return '<tr><td class="mono">' + esc(d.doc_id) + '</td><td>' + esc(d.filename) + '</td>' +
-      '<td class="c"><span class="badge ' + st[0] + '">' + st[1] + '</span></td>' +
-      '<td class="num">' + (d.slices == null ? '-' : d.slices) + '</td>' +
-      '<td class="num">' + fmtMs(d.upload_ms) + '</td><td class="num">' + fmtMs(d.parse_ms) + '</td>' +
-      '<td class="muted">' + esc(d.error || '') + '</td></tr>';
-  }).join('');
-  $('#m-docs').innerHTML = docs ? '<h2 style="margin-top:14px">文档解析明细</h2>' +
-    '<table><thead><tr><th>文档</th><th>文件</th><th class="c">状态</th><th class="num">切片</th>' +
-    '<th class="num">上传</th><th class="num">解析</th><th>错误</th></tr></thead><tbody>' +
-    docs + '</tbody></table>' : '';
-  var hints = (m.hints || []).map(function(h){ return '<li>' + esc(h) + '</li>'; }).join('');
-  $('#m-hints').innerHTML = hints ? '<div class="callout warn"><strong>排查建议</strong>' +
-    '<ul class="tight">' + hints + '</ul></div>' : '';
-}
-
-function switchTab(name){
-  document.querySelectorAll('.tabs button').forEach(function(b){
-    b.classList.toggle('active', b.dataset.tab === name);
-  });
-  document.querySelectorAll('.pane').forEach(function(p){
-    p.classList.toggle('active', p.id === 'pane-' + name);
-  });
-  if(name === 'report' && currentRun){
-    $('#report-frame').src = '/api/runs/' + currentRun + '/report';
-  }
-}
-
-function docIds(value){
-  return String(value || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
-}
-
-function syncDocChips(){
-  var cur = docIds($('#f-docs').value);
-  document.querySelectorAll('#doc-chips .chip-doc').forEach(function(b){
-    b.classList.toggle('on', cur.indexOf(b.dataset.doc) >= 0);
-  });
-}
-
-function toggleDoc(id){
-  var cur = docIds($('#f-docs').value);
-  var idx = cur.indexOf(id);
-  if(idx >= 0){ cur.splice(idx, 1); } else { cur.push(id); }
-  $('#f-docs').value = cur.join(',');
-  syncDocChips();
-}
-
-function renderCorpus(data){
-  var box = $('#doc-chips');
-  if(!box || !data || !data.available || !data.documents.length){ return; }
-  box.innerHTML = data.documents.map(function(d){
-    var tag = d.generated ? ' · 生成' : (d.optional ? ' · 可选' : '');
-    var title = (d.description || '') + '\\n文件：' + (d.filename || '-') +
-      '｜格式：' + (d.format || '-') +
-      '｜黄金问题：' + (d.generated ? '运行时生成' : d.queries + ' 条');
-    return '<button type="button" class="chip-doc" data-doc="' + esc(d.id) + '" title="' +
-      esc(title) + '">' + esc(d.id) + esc(tag) + '</button>';
-  }).join('');
-  box.querySelectorAll('.chip-doc').forEach(function(b){
-    b.onclick = function(){ toggleDoc(b.dataset.doc); };
-  });
-  syncDocChips();
-}
-
-function refreshList(){
-  api('/api/runs').then(function(d){
-    $('#info-concurrency').textContent = '运行中 ' + d.running + ' / 上限 ' + d.max_concurrent;
-    $('#hist-count').textContent = '共 ' + d.runs.length + ' 次';
-    $('#hist-body').innerHTML = d.runs.map(function(r){
-      var m = r.metrics || {};
-      return '<tr class="clickable' + (r.id === currentRun ? ' selected' : '') + '" data-id="' + esc(r.id) + '">' +
-        '<td class="mono">' + esc(r.started_at.replace('T',' ').slice(5,16)) + '</td>' +
-        '<td class="mono" title="' + esc(r.target) + '">' + esc(r.target) + '</td>' +
-        '<td class="c">' + statusBadge(r.status) + '</td>' +
-        '<td class="num">' + fmtNum(m.hit_rate) + '</td>' +
-        '<td class="num">' + fmtMs(m.search_p95_ms) + '</td></tr>';
-    }).join('') || '<tr><td colspan="5" class="muted">暂无运行记录</td></tr>';
-    document.querySelectorAll('#hist-body tr.clickable').forEach(function(tr){
-      tr.onclick = function(){ selectRun(tr.dataset.id); };
-    });
-  }).catch(function(e){ toast('刷新列表失败: ' + e.message, true); });
-}
-
-function init(){
-  api('/api/info').then(function(info){
-    $('#info-script').textContent = info.test_script;
-  }).catch(function(){});
-  api('/api/corpus').then(renderCorpus).catch(function(){});
-  $('#btn-start').onclick = startRun;
-  $('#btn-cancel').onclick = cancelRun;
-  $('#btn-report').onclick = function(){ window.open('/api/runs/' + currentRun + '/report', '_blank'); };
-  $('#btn-json').onclick = function(){ window.open('/api/runs/' + currentRun + '/json', '_blank'); };
-  document.querySelectorAll('.tabs button').forEach(function(b){
-    b.onclick = function(){ switchTab(b.dataset.tab); };
-  });
-  $('#f-target').addEventListener('keydown', function(e){ if(e.key === 'Enter') startRun(); });
-  $('#f-docs').addEventListener('input', syncDocChips);
-  listTimer = setInterval(refreshList, 5000);
-  refreshList();
-  var qs = new URLSearchParams(location.search);
-  var deepLink = qs.get('run');
-  if(deepLink){
-    selectRun(deepLink);
-    var deepTab = qs.get('tab');
-    if(deepTab){ switchTab(deepTab); }
-  }
-}
-init();
-</script>
-</body>
+      <footer class="page-footer">
+        HTKnow Evaluation · 每一次评测，都是质量的下一步
+      </footer>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script>
+      "use strict";
+      var $ = function (s) {
+        return document.querySelector(s);
+      };
+      var currentRun = null,
+        currentRunData = null,
+        logOffset = 0,
+        logTimer = null,
+        listTimer = null,
+        lastDone = null;
+      var runs = [],
+        initialList = true,
+        gateOnlyFailed = false,
+        answerOnlyFailed = false,
+        pollBusy = false,
+        selectionVersion = 0;
+      var modeNames = {
+        retrieval: "仅检索",
+        chat: "对话答案",
+        both: "完整链路",
+      };
+      function toast(msg, isErr) {
+        var el = $("#toast");
+        el.textContent = msg;
+        el.className = "show" + (isErr ? " err" : "");
+        clearTimeout(el._t);
+        el._t = setTimeout(function () {
+          el.className = "";
+        }, 4200);
+      }
+      function api(path, opts) {
+        return fetch(path, opts).then(function (r) {
+          return r.json().then(function (j) {
+            if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+            return j;
+          });
+        });
+      }
+      function esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+          return {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          }[c];
+        });
+      }
+      function fmtMs(v) {
+        if (v == null) return "—";
+        if (v < 1000) return Math.round(v) + " ms";
+        if (v < 60000) return (v / 1000).toFixed(2) + " s";
+        return (
+          Math.floor(v / 60000) + "m " + Math.round((v % 60000) / 1000) + "s"
+        );
+      }
+      function fmtNum(v, d) {
+        return v == null ? "—" : Number(v).toFixed(d == null ? 1 : d);
+      }
+      function dateLabel(s) {
+        return s ? String(s).replace("T", " ").slice(0, 16) : "—";
+      }
+      function badge(cls, label) {
+        return '<span class="badge ' + cls + '">' + esc(label) + "</span>";
+      }
+      function statusBadge(s) {
+        return badge(
+          {
+            running: "run",
+            pass: "ok",
+            fail: "bad",
+            error: "bad",
+            canceled: "warn",
+            interrupted: "warn",
+          }[s] || "na",
+          {
+            running: "运行中",
+            pass: "通过",
+            fail: "未达标",
+            error: "异常",
+            canceled: "已取消",
+            interrupted: "已中断",
+          }[s] || s,
+        );
+      }
+      function setConfigExpanded(expanded) {
+        $("#form-content").hidden = !expanded;
+        $("#btn-config").setAttribute("aria-expanded", String(expanded));
+        $("#btn-config").textContent = expanded ? "收起配置" : "展开配置";
+      }
+      function focusConfig() {
+        setConfigExpanded(true);
+        $("#config-panel").scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+        $("#f-target").focus({ preventScroll: true });
+      }
+      function updateMode() {
+        var mode = $("#f-mode").value;
+        document.querySelectorAll("[data-mode]").forEach(function (b) {
+          b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+        });
+        $("#answer-options").style.display = mode === "retrieval" ? "none" : "";
+        $("#retrieval-options").hidden = mode === "chat";
+        $("#mode-description").textContent = {
+          retrieval: "验证文档解析、检索命中与排序质量。",
+          chat: "用独立模型评审答案、证据与引用。",
+          both: "同时验证检索与对话，覆盖完整问答链路。",
+        }[mode];
+      }
+      function collectParams() {
+        var p = { target: $("#f-target").value.trim() };
+        [
+          "slice_type",
+          "upload_mode",
+          "cleanup",
+          "user_id",
+          "role",
+          "docs",
+          "exclude",
+          "mode",
+          "judge_mode",
+          "judge_url",
+          "judge_model",
+          "answer_categories",
+          "answer_seed",
+        ].forEach(function (k) {
+          var v = $("#f-" + k).value.trim();
+          if (v) p[k] = v;
+        });
+        [
+          "repeats",
+          "top_k",
+          "parse_timeout",
+          "min_hit_rate",
+          "min_mrr",
+          "min_ndcg",
+          "min_answer_in_context",
+          "min_parse_success",
+          "max_p95_ms",
+          "answer_limit",
+          "answer_repeats",
+        ].forEach(function (k) {
+          var v = $("#f-" + k).value;
+          if (v !== "") p[k] = Number(v);
+        });
+        [
+          "offline",
+          "public",
+          "strict_integrity",
+          "allow_negative_failure",
+        ].forEach(function (k) {
+          p[k] = $("#f-" + k).checked;
+        });
+        return p;
+      }
+      function validateInputs() {
+        var invalid = Array.from(
+          document.querySelectorAll("#form-content input"),
+        ).find(function (el) {
+          if (
+            $("#f-mode").value === "retrieval" &&
+            el.closest("#answer-options")
+          )
+            return false;
+          if ($("#f-mode").value === "chat" && el.closest("#retrieval-options"))
+            return false;
+          return !el.checkValidity();
+        });
+        if (!invalid) return true;
+        setConfigExpanded(true);
+        var parent = invalid.parentElement;
+        while (parent && parent.id !== "form-content") {
+          if (parent.tagName === "DETAILS") parent.open = true;
+          parent = parent.parentElement;
+        }
+        invalid.reportValidity();
+        invalid.focus();
+        return false;
+      }
+      function startRun() {
+        if ($("#btn-start").disabled) return;
+        if (!validateInputs()) return;
+        var p = collectParams();
+        if (!p.target) {
+          toast("请先填写目标服务地址", true);
+          focusConfig();
+          return;
+        }
+        var btn = $("#btn-start");
+        btn.disabled = true;
+        btn.textContent = "正在创建评测…";
+        api("/api/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(p),
+        })
+          .then(function (run) {
+            toast("评测已启动，可以查看实时日志");
+            selectRun(run.id, "log");
+            if (window.innerWidth <= 820) {
+              setConfigExpanded(false);
+              $("#run-section").scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              });
+            }
+            refreshList();
+          })
+          .catch(function (e) {
+            toast(e.message, true);
+          })
+          .then(function () {
+            btn.disabled = false;
+            btn.textContent = "开始评测";
+          });
+      }
+      function cancelRun() {
+        if (!currentRun) return;
+        $("#btn-cancel").disabled = true;
+        api("/api/runs/" + encodeURIComponent(currentRun) + "/cancel", {
+          method: "POST",
+        })
+          .then(function () {
+            toast("评测已取消");
+            pollOnce(true);
+            refreshList();
+          })
+          .catch(function (e) {
+            toast(e.message, true);
+            pollOnce(true);
+          });
+      }
+      function selectRun(id, preferredTab) {
+        selectionVersion++;
+        currentRun = id;
+        currentRunData = null;
+        logOffset = 0;
+        lastDone = null;
+        pollBusy = false;
+        gateOnlyFailed = false;
+        answerOnlyFailed = false;
+        $("#log").textContent = "";
+        $("#run-section").style.display = "";
+        $("#empty-section").style.display = "none";
+        $("#report-frame").src = "about:blank";
+        $("#r-target").textContent = "正在读取评测…";
+        $("#r-meta").textContent = id;
+        $("#r-summary").innerHTML = "";
+        $("#r-highlights").innerHTML = "";
+        $("#r-warn").innerHTML = "";
+        $("#m-gates").innerHTML = '<p class="muted">正在读取评测结果…</p>';
+        ["#m-answers", "#m-docs", "#m-cards", "#m-hints"].forEach(function (s) {
+          $(s).innerHTML = "";
+        });
+        $("#r-status").outerHTML =
+          '<span class="badge na" id="r-status" role="status">读取中</span>';
+        ["#btn-cancel", "#btn-report", "#btn-json"].forEach(function (s) {
+          $(s).disabled = true;
+        });
+        var known = runs.find(function (r) {
+          return r.id === id;
+        });
+        switchTab(
+          preferredTab ||
+            (known && known.status !== "running" ? "metrics" : "log"),
+        );
+        if (logTimer) clearInterval(logTimer);
+        logTimer = setInterval(function () {
+          pollOnce(false);
+        }, 1000);
+        pollOnce(true);
+        renderHistory();
+        var query = new URLSearchParams(location.search);
+        query.set("run", id);
+        query.set("tab", $(".tabs button.active").dataset.tab);
+        history.replaceState(null, "", "?" + query.toString());
+      }
+      function pollOnce(force) {
+        if (!currentRun || pollBusy) return;
+        pollBusy = true;
+        var id = currentRun,
+          version = selectionVersion,
+          receivedLogChunk = false;
+        return api(
+          "/api/runs/" + encodeURIComponent(id) + "/log?offset=" + logOffset,
+        )
+          .then(function (d) {
+            if (version !== selectionVersion) return null;
+            logOffset = d.offset;
+            if (d.chunk) {
+              receivedLogChunk = true;
+              var el = $("#log"),
+                near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              el.textContent += d.chunk;
+              if (near) el.scrollTop = el.scrollHeight;
+            }
+            return api("/api/runs/" + encodeURIComponent(id));
+          })
+          .then(function (run) {
+            if (!run || version !== selectionVersion) return;
+            currentRunData = run;
+            renderRun(run);
+            if (run.status !== "running") {
+              // Drain all log pages and allow one final read after completion.
+              if (lastDone === run.id && !receivedLogChunk) {
+                clearInterval(logTimer);
+                logTimer = null;
+              }
+              if (lastDone !== run.id) {
+                lastDone = run.id;
+                renderMetrics(run);
+                refreshList();
+                if (!force)
+                  toast(
+                    run.status === "pass"
+                      ? "评测完成，关键门禁全部达标"
+                      : run.status === "fail"
+                        ? "评测完成，请查看未达标门禁"
+                        : "评测已结束，请查看运行详情",
+                    run.status !== "pass",
+                  );
+              }
+            }
+            if (force) renderMetrics(run);
+          })
+          .catch(function (e) {
+            if (force && version === selectionVersion)
+              toast("读取运行失败：" + e.message, true);
+          })
+          .then(function () {
+            if (version === selectionVersion) pollBusy = false;
+          });
+      }
+      function renderRun(run) {
+        var mode = (run.params || {}).mode || "retrieval";
+        $("#r-status").outerHTML = statusBadge(run.status).replace(
+          'class="badge',
+          'id="r-status" role="status" class="badge',
+        );
+        $("#r-kind").textContent = modeNames[mode] + " / 评测结果";
+        $("#r-target").textContent = run.target;
+        $("#r-meta").textContent = run.id;
+        $("#r-meta").title = run.command ? "等效命令行：\n" + run.command : "";
+        $("#r-date").textContent =
+          dateLabel(run.started_at) +
+          " · " +
+          (run.status === "running" ? "已运行 " : "用时 ") +
+          fmtMs(run.elapsed_s * 1000);
+        $("#btn-cancel").hidden = run.status !== "running";
+        $("#btn-cancel").disabled = run.status !== "running";
+        $("#btn-report").disabled = !run.has_report;
+        $("#btn-json").disabled = !run.has_json;
+        $("#log-status").textContent =
+          run.status === "running"
+            ? "实时输出 · 自动滚动至最新"
+            : "运行已结束 · 日志已完整保留";
+        var warnings = (run.metrics && run.metrics.warnings) || [];
+        $("#r-warn").innerHTML = run.error
+          ? '<div class="callout bad">' + esc(run.error) + "</div>"
+          : warnings.length
+            ? '<details class="callout warn"><summary>运行提醒 · ' +
+              warnings.length +
+              " 项</summary><ul>" +
+              warnings
+                .map(function (w) {
+                  return "<li>" + esc(w) + "</li>";
+                })
+                .join("") +
+              "</ul></details>"
+            : "";
+        renderSummary(run);
+      }
+      function renderSummary(run) {
+        var m = run.metrics || {},
+          gates = (m.gates || []).filter(function (g) {
+            return g.threshold != null;
+          }),
+          passed = gates.filter(function (g) {
+            return g.passed;
+          }).length,
+          failed = gates.length - passed;
+        var titles = {
+          running: "评测正在进行",
+          pass: "关键门禁全部达标",
+          fail: "部分验收门禁未达标",
+          error: "本次评测异常结束",
+          canceled: "本次评测已取消",
+          interrupted: "本次评测已中断",
+        };
+        var desc =
+          run.status === "running"
+            ? "正在执行测试，结果将在运行结束后汇总。"
+            : gates.length
+              ? "已检查 " +
+                gates.length +
+                " 项门禁，" +
+                passed +
+                " 项通过" +
+                (failed ? "，" + failed + " 项未通过。" : "。")
+              : "请查看日志，了解本次运行的详细情况。";
+        if (m.answers && m.answers.semantic_status !== "complete")
+          desc += " 答案语义评审尚未完整完成。";
+        var cls =
+          {
+            pass: "ok",
+            fail: "bad",
+            error: "bad",
+            canceled: "warn",
+            interrupted: "warn",
+          }[run.status] || "";
+        $("#r-summary").innerHTML =
+          '<div class="conclusion ' +
+          cls +
+          '"><div><strong>' +
+          esc(titles[run.status] || "评测结果") +
+          "</strong><p>" +
+          esc(desc) +
+          "</p></div>" +
+          (gates.length
+            ? '<div class="gate-score">' +
+              passed +
+              "<small>/ " +
+              gates.length +
+              "</small></div>"
+            : "") +
+          "</div>";
+        var am = m.answers && m.answers.metrics;
+        var cards = am
+          ? [
+              [
+                "答案正确率",
+                fmtNum(am.correctness),
+                "%",
+                "参考事实与回答一致性",
+              ],
+              [
+                "证据忠实度",
+                fmtNum(am.faithfulness),
+                "%",
+                "陈述是否有证据支持",
+              ],
+              [
+                "引用准确率",
+                fmtNum(am.citation_precision),
+                "%",
+                "引用是否支撑对应陈述",
+              ],
+              [
+                "语义评审覆盖率",
+                fmtNum(am.judge_coverage),
+                "%",
+                "完成独立模型评审的比例",
+              ],
+            ]
+          : [
+              [
+                "检索命中率",
+                fmtNum(m.hit_rate),
+                "%",
+                "Hit@" + (m.eval_k || "K") + " · 目标文档命中",
+              ],
+              ["排序质量", fmtNum(m.mrr, 3), "", "MRR · 首个正确结果排名"],
+              [
+                "上下文命中率",
+                fmtNum(m.answer_in_context),
+                "%",
+                "答案是否出现在上下文",
+              ],
+              ["检索 P95", fmtMs(m.search_p95_ms), "", "95% 的检索请求耗时"],
+            ];
+        $("#r-highlights").innerHTML = run.metrics
+          ? cards
+              .map(function (c) {
+                return (
+                  '<div class="highlight"><div class="k">' +
+                  esc(c[0]) +
+                  '</div><div class="v">' +
+                  esc(c[1]) +
+                  (c[1] === "—"
+                    ? ""
+                    : '<span class="u">' + esc(c[2]) + "</span>") +
+                  '</div><div class="caption">' +
+                  esc(c[3]) +
+                  "</div></div>"
+                );
+              })
+              .join("")
+          : "";
+        $("#r-highlights").hidden = !run.metrics;
+      }
+      function metricValue(v, unit) {
+        return v == null
+          ? "—"
+          : unit === "ms"
+            ? fmtMs(v)
+            : unit === "%"
+              ? fmtNum(v) + "%"
+              : fmtNum(v, 3);
+      }
+      function renderGates(m) {
+        var all = m.gates || [],
+          active = all.filter(function (g) {
+            return g.threshold != null;
+          }),
+          failed = active.filter(function (g) {
+            return !g.passed;
+          });
+        var filtered = gateOnlyFailed ? failed : all;
+        $("#m-gates").innerHTML =
+          '<div class="result-block"><div class="block-heading"><div><h2>验收门禁</h2><p>' +
+          active.length +
+          " 项已启用 · " +
+          failed.length +
+          ' 项未通过</p></div><button id="gate-filter" class="filter-button" aria-pressed="' +
+          gateOnlyFailed +
+          '">仅看未通过</button></div><div class="tbl-wrap"><table class="gate-table"><thead><tr><th>验收项</th><th class="num">实测值</th><th class="num">验收要求</th><th class="c">结果</th><th>说明</th></tr></thead><tbody>' +
+          filtered
+            .map(function (g) {
+              return (
+                '<tr><td class="gate-name" title="' +
+                esc(g.metric) +
+                '">' +
+                esc(g.name) +
+                '</td><td class="num gate-value">' +
+                esc(metricValue(g.actual, g.unit)) +
+                '</td><td class="num gate-requirement">' +
+                (g.threshold == null
+                  ? "未启用"
+                  : esc(
+                      g.comparator + " " + metricValue(g.threshold, g.unit),
+                    )) +
+                '</td><td class="c">' +
+                (g.threshold == null
+                  ? badge("na", "未启用")
+                  : g.passed
+                    ? badge("ok", "通过")
+                    : badge("bad", "未通过")) +
+                '</td><td class="gate-note">' +
+                esc(g.note || "—") +
+                "</td></tr>"
+              );
+            })
+            .join("") +
+          (filtered.length
+            ? ""
+            : '<tr><td colspan="5" class="table-empty">' +
+              (gateOnlyFailed ? "没有未通过的验收门禁" : "暂无验收门禁") +
+              "</td></tr>") +
+          "</tbody></table></div></div>";
+        $("#gate-filter").onclick = function () {
+          gateOnlyFailed = !gateOnlyFailed;
+          renderGates(m);
+          $("#gate-filter").focus({ preventScroll: true });
+        };
+      }
+      function renderAnswers(a) {
+        if (!a) {
+          $("#m-answers").innerHTML = "";
+          return;
+        }
+        var rows = a.rows || [],
+          failed = rows.filter(function (r) {
+            return !r.passed;
+          }),
+          filtered = answerOnlyFailed ? failed : rows;
+        var semantic =
+          {
+            complete: "语义评审已完成",
+            incomplete: "语义评审未完整完成",
+            not_evaluated: "语义未评估",
+          }[a.semantic_status] || a.semantic_status;
+        $("#m-answers").innerHTML =
+          '<div class="result-block"><div class="block-heading"><div><h2>逐题答案评估</h2><p>' +
+          rows.length +
+          " 条结果 · " +
+          esc(semantic) +
+          " · " +
+          failed.length +
+          ' 条未通过</p></div><button id="answer-filter" class="filter-button" aria-pressed="' +
+          answerOnlyFailed +
+          '">仅看未通过</button></div><div class="tbl-wrap"><table class="answer-table"><thead><tr><th>用例</th><th>次 / 轮</th><th>结果</th><th>诊断</th></tr></thead><tbody>' +
+          filtered
+            .map(function (r) {
+              return (
+                '<tr><td class="mono answer-case">' +
+                esc(r.case_id) +
+                '</td><td class="mono">' +
+                esc(r.repeat) +
+                " / " +
+                esc(r.turn) +
+                "</td><td>" +
+                (r.passed ? badge("ok", "通过") : badge("bad", "未通过")) +
+                '</td><td class="diagnosis">' +
+                esc(r.diagnosis) +
+                "</td></tr>"
+              );
+            })
+            .join("") +
+          (filtered.length
+            ? ""
+            : '<tr><td colspan="4" class="table-empty">' +
+              (answerOnlyFailed ? "没有未通过的用例" : "暂无逐题评估结果") +
+              "</td></tr>") +
+          '</tbody></table></div><p class="field-help">完整答案、原文证据与评分依据可在完整报告中查看。</p></div>';
+        $("#answer-filter").onclick = function () {
+          answerOnlyFailed = !answerOnlyFailed;
+          renderAnswers(a);
+          $("#answer-filter").focus({ preventScroll: true });
+        };
+      }
+      function renderMetrics(run) {
+        var m = run.metrics;
+        if (!m) {
+          $("#m-gates").innerHTML =
+            '<p class="muted">' +
+            (run.status === "running"
+              ? "评测进行中，指标将在结束后汇总。可先查看运行日志。"
+              : "本次运行未生成指标，请查看日志与运行提醒。") +
+            "</p>";
+          ["#m-cards", "#m-docs", "#m-answers", "#m-hints"].forEach(
+            function (s) {
+              $(s).innerHTML = "";
+            },
+          );
+          $("#all-metrics").hidden = true;
+          return;
+        }
+        $("#all-metrics").hidden = false;
+        var cards = [
+          ["解析成功率", fmtNum(m.parse_success_rate), "%"],
+          ["解析 P95", fmtMs(m.parse_p95_ms), ""],
+          ["切片总数", m.total_slices == null ? "—" : m.total_slices, ""],
+        ];
+        if (m.mode !== "chat") {
+          cards = cards.concat([
+            ["Hit@" + (m.eval_k || "K"), fmtNum(m.hit_rate), "%"],
+            ["MRR", fmtNum(m.mrr, 3), ""],
+            ["nDCG", fmtNum(m.ndcg, 3), ""],
+            ["上下文命中率", fmtNum(m.answer_in_context), "%"],
+            ["负样本通过率", fmtNum(m.negative_pass_rate), "%"],
+            ["检索 P95", fmtMs(m.search_p95_ms), ""],
+          ]);
+        }
+        if (m.answers) {
+          var am = m.answers.metrics;
+          cards = cards.concat([
+            ["答案正确率", fmtNum(am.correctness), "%"],
+            ["事实覆盖率", fmtNum(am.fact_completeness), "%"],
+            ["证据忠实度", fmtNum(am.faithfulness), "%"],
+            ["引用准确率", fmtNum(am.citation_precision), "%"],
+            ["引用覆盖率", fmtNum(am.citation_coverage), "%"],
+            ["正确处理无答案题", fmtNum(am.abstention_rate), "%"],
+            ["语义评审覆盖率", fmtNum(am.judge_coverage), "%"],
+            ["对话总耗时 P95", fmtMs((am.latency || {}).p95), ""],
+            ["首段文本 P95", fmtMs((am.first_text_latency || {}).p95), ""],
+          ]);
+        }
+        $("#m-cards").innerHTML = cards
+          .map(function (c) {
+            return (
+              '<div class="card"><div class="k">' +
+              esc(c[0]) +
+              '</div><div class="v">' +
+              esc(c[1]) +
+              (c[1] === "—" ? "" : '<span class="u">' + esc(c[2]) + "</span>") +
+              "</div></div>"
+            );
+          })
+          .join("");
+        renderGates(m);
+        renderAnswers(m.answers);
+        var docs = m.documents || [],
+          stages = {
+            completed: ["ok", "解析完成"],
+            skipped: ["warn", "跳过"],
+            parse_failed: ["bad", "解析失败"],
+            parse_timeout: ["bad", "解析超时"],
+            upload_failed: ["bad", "上传失败"],
+            download_failed: ["bad", "语料获取失败"],
+          };
+        $("#m-docs").innerHTML = docs.length
+          ? '<details class="details-block"><summary>文档解析明细<span>' +
+            docs.length +
+            " 份文档 · " +
+            (m.total_slices == null ? "—" : esc(m.total_slices)) +
+            ' 个切片</span></summary><div class="tbl-wrap"><table class="doc-table"><thead><tr><th>文档</th><th>状态</th><th class="num">切片</th><th class="num">上传耗时</th><th class="num">解析耗时</th><th>说明</th></tr></thead><tbody>' +
+            docs
+              .map(function (d) {
+                var st = stages[d.stage] || ["na", d.stage];
+                return (
+                  '<tr><td><div class="mono">' +
+                  esc(d.doc_id) +
+                  '</div><div class="file-name">' +
+                  esc(d.filename) +
+                  "</div></td><td>" +
+                  badge(st[0], st[1]) +
+                  '</td><td class="num">' +
+                  (d.slices == null ? "—" : esc(d.slices)) +
+                  '</td><td class="num">' +
+                  fmtMs(d.upload_ms) +
+                  '</td><td class="num">' +
+                  fmtMs(d.parse_ms) +
+                  '</td><td class="gate-note">' +
+                  esc(d.error || "—") +
+                  "</td></tr>"
+                );
+              })
+              .join("") +
+            "</tbody></table></div></details>"
+          : "";
+        var hints = m.hints || [];
+        $("#m-hints").innerHTML = hints.length
+          ? '<details class="callout warn"><summary>排查建议 · ' +
+            hints.length +
+            " 项</summary><ul>" +
+            hints
+              .map(function (h) {
+                return "<li>" + esc(h) + "</li>";
+              })
+              .join("") +
+            "</ul></details>"
+          : "";
+      }
+      function switchTab(name) {
+        if (["log", "metrics", "report"].indexOf(name) < 0) return;
+        document.querySelectorAll(".tabs button").forEach(function (b) {
+          var active = b.dataset.tab === name;
+          b.classList.toggle("active", active);
+          b.setAttribute("aria-selected", String(active));
+          b.tabIndex = active ? 0 : -1;
+        });
+        document.querySelectorAll(".pane").forEach(function (p) {
+          p.classList.toggle("active", p.id === "pane-" + name);
+        });
+        if (name === "report" && currentRun) {
+          var url = "/api/runs/" + encodeURIComponent(currentRun) + "/report";
+          if ($("#report-frame").getAttribute("src") !== url)
+            $("#report-frame").src = url;
+        }
+        if (currentRun) {
+          var query = new URLSearchParams(location.search);
+          query.set("run", currentRun);
+          query.set("tab", name);
+          history.replaceState(null, "", "?" + query.toString());
+        }
+      }
+      function docIds(value) {
+        return String(value || "")
+          .split(",")
+          .map(function (s) {
+            return s.trim();
+          })
+          .filter(Boolean);
+      }
+      function syncDocChips() {
+        var cur = docIds($("#f-docs").value);
+        document.querySelectorAll("#doc-chips .chip-doc").forEach(function (b) {
+          var on = cur.indexOf(b.dataset.doc) >= 0;
+          b.classList.toggle("on", on);
+          b.setAttribute("aria-pressed", String(on));
+        });
+      }
+      function renderCorpus(data) {
+        if (!data || !data.available || !data.documents.length) return;
+        $("#doc-chips").innerHTML = data.documents
+          .map(function (d) {
+            return (
+              '<button type="button" class="chip-doc" data-doc="' +
+              esc(d.id) +
+              '" aria-pressed="false" title="' +
+              esc((d.description || "") + " · " + (d.filename || "")) +
+              '">' +
+              esc(d.id) +
+              (d.optional ? " · 可选" : "") +
+              "</button>"
+            );
+          })
+          .join("");
+        document.querySelectorAll("#doc-chips .chip-doc").forEach(function (b) {
+          b.onclick = function () {
+            var cur = docIds($("#f-docs").value),
+              i = cur.indexOf(b.dataset.doc);
+            if (i >= 0) cur.splice(i, 1);
+            else cur.push(b.dataset.doc);
+            $("#f-docs").value = cur.join(",");
+            syncDocChips();
+          };
+        });
+        syncDocChips();
+      }
+      function renderHistory() {
+        var filter = $("#hist-search").value.trim().toLowerCase(),
+          filtered = runs.filter(function (r) {
+            return (
+              !filter ||
+              [r.id, r.target, modeNames[(r.params || {}).mode || "retrieval"]]
+                .join(" ")
+                .toLowerCase()
+                .indexOf(filter) >= 0
+            );
+          });
+        $("#hist-count").textContent = filter
+          ? filtered.length + " / " + runs.length
+          : runs.length + " 次";
+        $("#hist-body").innerHTML =
+          filtered
+            .map(function (r) {
+              var m = r.metrics || {},
+                mode = (r.params || {}).mode || "retrieval",
+                am = m.answers && m.answers.metrics,
+                quality =
+                  mode !== "retrieval" && am ? am.correctness : m.hit_rate,
+                p95 =
+                  mode !== "retrieval" && am
+                    ? (am.latency || {}).p95
+                    : m.search_p95_ms;
+              return (
+                '<tr class="clickable' +
+                (r.id === currentRun ? " selected" : "") +
+                '" data-id="' +
+                esc(r.id) +
+                '"' +
+                (r.id === currentRun ? ' aria-current="true"' : "") +
+                '><td><button class="history-open" data-run="' +
+                esc(r.id) +
+                '" aria-label="查看 ' +
+                esc(r.target + " " + dateLabel(r.started_at) + " 的评测结果") +
+                '">' +
+                esc(r.target) +
+                '</button><div class="history-time mono">' +
+                esc(dateLabel(r.started_at)) +
+                '</div></td><td class="mode-label">' +
+                esc(modeNames[mode]) +
+                "</td><td>" +
+                statusBadge(r.status) +
+                '</td><td class="num" title="' +
+                (mode !== "retrieval" && am ? "答案正确率" : "检索命中率") +
+                '">' +
+                fmtNum(quality) +
+                (quality == null ? "" : '<span class="muted">%</span>') +
+                '</td><td class="num mono">' +
+                fmtMs(p95) +
+                "</td></tr>"
+              );
+            })
+            .join("") ||
+          '<tr><td colspan="5" class="table-empty">' +
+            (filter
+              ? "没有匹配的运行记录"
+              : "暂无运行记录，从左侧开始第一次评测") +
+            "</td></tr>";
+        document
+          .querySelectorAll("#hist-body tr.clickable")
+          .forEach(function (tr) {
+            tr.onclick = function () {
+              selectRun(tr.dataset.id);
+            };
+          });
+      }
+      function refreshList() {
+        return api("/api/runs")
+          .then(function (d) {
+            runs = d.runs;
+            $("#info-concurrency").textContent = d.running
+              ? "运行中 " + d.running + " / " + d.max_concurrent
+              : "暂无运行任务";
+            $("#service-status").classList.add("ready");
+            $("#service-status").title =
+              "最多同时运行 " + d.max_concurrent + " 个评测";
+            $("#overview-count").textContent = runs.length;
+            $("#overview-latest").textContent = runs.length
+              ? "最近运行 " + dateLabel(runs[0].started_at)
+              : "建立你的质量基线";
+            renderHistory();
+            if (initialList) {
+              initialList = false;
+              var qs = new URLSearchParams(location.search),
+                id = qs.get("run"),
+                tab = qs.get("tab");
+              if (id) selectRun(id, tab);
+              else if (runs.length) selectRun(runs[0].id);
+              if (runs.length && window.innerWidth <= 820)
+                setConfigExpanded(false);
+            }
+          })
+          .catch(function (e) {
+            $("#service-status").classList.remove("ready");
+            $("#info-concurrency").textContent = "连接暂时中断";
+            if (initialList) {
+              $("#hist-body").innerHTML =
+                '<tr><td colspan="5" class="table-empty">无法读取记录，将自动重试</td></tr>';
+              toast("读取运行记录失败：" + e.message, true);
+            }
+          });
+      }
+      function init() {
+        api("/api/info")
+          .then(function (info) {
+            $("#judge-status").textContent = info.judge_configured
+              ? "已配置独立评审模型 · " + info.judge_model
+              : "尚未配置评审模型，请展开下方选项填写。";
+          })
+          .catch(function () {
+            $("#judge-status").textContent = "暂时无法读取评审配置";
+          });
+        api("/api/corpus")
+          .then(renderCorpus)
+          .catch(function () {});
+        $("#btn-start").onclick = startRun;
+        $("#btn-cancel").onclick = cancelRun;
+        $("#btn-new").onclick = focusConfig;
+        $("#btn-empty-start").onclick = focusConfig;
+        $("#btn-config").onclick = function () {
+          setConfigExpanded($("#form-content").hidden);
+        };
+        $("#btn-report").onclick = function () {
+          window.open(
+            "/api/runs/" + encodeURIComponent(currentRun) + "/report",
+            "_blank",
+            "noopener",
+          );
+        };
+        $("#btn-json").onclick = function () {
+          window.open(
+            "/api/runs/" + encodeURIComponent(currentRun) + "/json",
+            "_blank",
+            "noopener",
+          );
+        };
+        $("#btn-log-bottom").onclick = function () {
+          var el = $("#log");
+          el.scrollTop = el.scrollHeight;
+        };
+        document.querySelectorAll("[data-mode]").forEach(function (b) {
+          b.onclick = function () {
+            $("#f-mode").value = b.dataset.mode;
+            updateMode();
+          };
+        });
+        document.querySelectorAll(".tabs button").forEach(function (b) {
+          b.onclick = function () {
+            switchTab(b.dataset.tab);
+          };
+          b.onkeydown = function (e) {
+            var tabs = Array.from(document.querySelectorAll(".tabs button")),
+              i = tabs.indexOf(b),
+              next =
+                e.key === "ArrowRight"
+                  ? (i + 1) % tabs.length
+                  : e.key === "ArrowLeft"
+                    ? (i + tabs.length - 1) % tabs.length
+                    : e.key === "Home"
+                      ? 0
+                      : e.key === "End"
+                        ? tabs.length - 1
+                        : null;
+            if (next != null) {
+              e.preventDefault();
+              switchTab(tabs[next].dataset.tab);
+              tabs[next].focus();
+            }
+          };
+        });
+        $("#f-target").addEventListener("keydown", function (e) {
+          if (e.key === "Enter") startRun();
+        });
+        $("#f-mode").onchange = updateMode;
+        $("#f-docs").addEventListener("input", syncDocChips);
+        $("#hist-search").addEventListener("input", renderHistory);
+        updateMode();
+        refreshList();
+        listTimer = setInterval(refreshList, 5000);
+      }
+      init();
+    </script>
+  </body>
 </html>
 """
 
@@ -1177,6 +3768,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     global MANAGER
 
     args = parse_args(argv)
+    from e2e_judge import JudgeError, judge_settings
+    try:
+        settings = judge_settings()
+    except JudgeError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
     if not TEST_SCRIPT.exists():
         print(f"[错误] 找不到测试脚本：{TEST_SCRIPT}", file=sys.stderr)
         print("       请确认 e2e_web.py 与 e2e_retrieval_test.py 位于同一目录。", file=sys.stderr)
@@ -1200,6 +3797,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "max_history": args.max_history,
         "python": sys.version.split()[0],
         "history": len(MANAGER.runs),
+        "judge_configured": bool(settings["E2E_JUDGE_URL"] and settings["E2E_JUDGE_MODEL"]),
+        "judge_model": settings["E2E_JUDGE_MODEL"] or None,
         "defaults": DEFAULT_PARAMS,
     })
 
