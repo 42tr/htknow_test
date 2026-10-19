@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 CATEGORIES = {
     "facts": "事实问答", "cross_document": "跨文档问答", "abstention": "无答案处理",
     "multi_turn": "多轮对话", "wiki": "Wiki 问答", "safety": "安全与权限",
+    "complex_reasoning": "复杂推理", "partial_answer": "部分可回答", "advanced_multi_turn": "多轮纠错与假设",
 }
 STATES = {"pass": ("ok", "通过"), "fail": ("bad", "答案问题"),
           "judge": ("warn", "评审未完成"), "error": ("bad", "执行异常")}

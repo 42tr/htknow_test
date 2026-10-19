@@ -8,7 +8,7 @@
   计算 Hit@K / MRR@K / nDCG@K / 答案在上下文率 / 关键词覆盖率与延迟分位数
 - **门禁化**：任一关键门禁未达标即以退出码 `1` 失败，可直接接入 CI
 - **自包含报告**：单文件 HTML（内联 CSS + SVG，无 CDN），可离线在内网传阅、归档、打印
-- **生成答案评估**：60 个合成事实用例、70 轮请求，覆盖事实、汇总、无答案、多轮、Wiki 与权限隔离；
+- **生成答案评估**：80 个合成事实用例、100 轮请求，覆盖事实、汇总、无答案、多轮、Wiki、权限隔离与复杂推理；
   分别计算答案正确性、证据忠实度、引用质量与评审覆盖率
 
 本仓只含测试工具，不含被测服务代码。
@@ -21,7 +21,7 @@ scripts/e2e_web.py                Web 控制台（浏览器操作 + 历史运行
 scripts/e2e_corpus.json           语料清单与黄金问题集（ground truth）
 scripts/e2e_answer_eval.py        对话评估入口、完整 SSE 采集与逐题证据报告
 scripts/e2e_answer_report.py      可筛选的逐题复盘、参考事实对照与引用证据定位
-scripts/e2e_answer_cases.json     60 个答案评估用例及运行时合成事实模板
+scripts/e2e_answer_cases.json     80 个答案评估用例及运行时合成事实模板
 scripts/e2e_judge.py              独立模型评审、评分结构与证据引句校验
 tests/test_answer_eval.py         离线协议与端到端回归测试
 docs/e2e-retrieval-test.md        指标口径、门禁阈值、语料说明与排查建议
@@ -74,6 +74,10 @@ python3 scripts/e2e_answer_eval.py --target 192.168.0.46:11000 \
 
 # 只准备题集和事实文档，无需被测服务或评审模型
 python3 scripts/e2e_retrieval_test.py --mode chat --dry-run --offline
+
+# 仅测新增的20个复杂用例（30轮），事实与旧基线分库保存
+python3 scripts/e2e_retrieval_test.py --target 127.0.0.1:13000 --mode chat \
+  --answer-categories complex_reasoning,partial_answer,advanced_multi_turn
 
 # 只验证协议、精确事实与引用规则；语义门禁未通过，预期退出码为 1
 python3 scripts/e2e_retrieval_test.py --target 192.168.0.46:11000 \

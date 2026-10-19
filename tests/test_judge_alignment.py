@@ -24,6 +24,58 @@ def claim():
 
 
 class GroundingAlignmentTests(unittest.TestCase):
+    def test_duplicate_information_limit_with_source_support_requires_consistent_classification(self):
+        answer = "基础预算112万元[1]。\n现有资料不足以回答问题的其余部分，请补充相关资料。"
+        duplicate = {"claim": "未提供其余信息", "answer_span_ids": [2], "verdict": "supported",
+                     "support": [{"source_id": 1, "passage_ids": [2]}], "citations": []}
+        payload = {"claims": [claim(), duplicate], "information_limits": [{"answer_span_ids": [2]}]}
+        judge = judging.Judge(mode="rules")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judge, "_call", side_effect=[
+            {"result": payload, "usage": None, "elapsed_ms": 1},
+            {"result": {"claims": [claim()], "information_limits": [{"answer_span_ids": [2]}]},
+             "usage": None, "elapsed_ms": 1},
+        ]) as call:
+            result = judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                {"answer": answer, "sources": judging.visible_sources([SOURCE])}, Path(directory),
+                lambda p: judging.validate_grounding(p, [SOURCE], answer, True))
+        feedback = call.call_args_list[1].args[2]["validation_feedback"]
+        self.assertTrue(feedback["details"]["classification_conflict"])
+        self.assertEqual(len(result["result"]["claims"]), 1)
+        self.assertTrue(result["result"]["claims"][0]["citations"][0]["supported"])
+        self.assertEqual(call.call_count, 2)
+
+    def test_uncited_positive_fact_remains_a_fact_after_classification_repair(self):
+        answer = "基础预算112万元。"
+        positive = claim()
+        positive["citations"] = []
+        judge = judging.Judge(mode="rules")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judge, "_call", side_effect=[
+            {"result": {"claims": [positive], "information_limits": [{"answer_span_ids": [1]}]},
+             "usage": None, "elapsed_ms": 1},
+            {"result": {"claims": [claim()]}, "usage": None, "elapsed_ms": 1},
+        ]) as call:
+            result = judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                {"answer": answer, "sources": judging.visible_sources([SOURCE])}, Path(directory),
+                lambda p: judging.validate_grounding(p, [SOURCE], answer, True))
+        self.assertEqual(len(result["result"]["claims"]), 1)
+        self.assertEqual(result["result"]["claims"][0]["citations"], [])
+        self.assertEqual(call.call_count, 2)
+
+    def test_classification_repair_cannot_hide_all_positive_facts_as_information_limits(self):
+        answer = "基础预算112万元。"
+        positive = claim()
+        positive["citations"] = []
+        judge = judging.Judge(mode="rules")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judge, "_call", side_effect=[
+            {"result": {"claims": [positive], "information_limits": [{"answer_span_ids": [1]}]},
+             "usage": None, "elapsed_ms": 1},
+            {"result": {"claims": [], "information_limits": [{"answer_span_ids": [1]}]},
+             "usage": None, "elapsed_ms": 1},
+        ]), self.assertRaisesRegex(judging.JudgeError, "未提取回答中的事实"):
+            judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                {"answer": answer, "sources": judging.visible_sources([SOURCE])}, Path(directory),
+                lambda p: judging.validate_grounding(p, [SOURCE], answer, True))
+
     def test_malformed_model_json_gets_one_recorded_format_repair_with_usage(self):
         answer = "基础预算112万元[1]。"
         opener = MagicMock()

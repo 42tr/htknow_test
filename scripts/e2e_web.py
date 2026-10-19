@@ -2338,7 +2338,7 @@ UI_HTML = r"""<!doctype html>
                       max="500"
                       value="0"
                     />
-                    <p class="field-help">0 表示全部 60 个用例</p>
+                    <p class="field-help">0 表示全部 80 个用例，共 100 轮</p>
                   </div>
                   <div class="field">
                     <label for="f-answer_repeats">每用例重复次数</label
@@ -2361,7 +2361,8 @@ UI_HTML = r"""<!doctype html>
                       placeholder="facts,multi_turn"
                     />
                     <p class="field-help">
-                      留空评测全部分类；多个分类用逗号分隔
+                      留空评测全部分类；多个分类用逗号分隔。复杂题可填
+                      complex_reasoning,partial_answer,advanced_multi_turn
                     </p>
                   </div>
                   <div class="field">

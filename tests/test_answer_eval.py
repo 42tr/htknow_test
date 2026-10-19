@@ -237,6 +237,8 @@ class MockService:
             def sources(self, kb, query=""):
                 if not self.allowed(kb):
                     return []
+                if outer.mode == "complex_unsearchable" and outer.kbs[kb]["name"].startswith("E2E复杂推理-"):
+                    return []
                 result = []
                 for fid, file in outer.files.items():
                     if file["kb_id"] == kb:
@@ -261,7 +263,8 @@ class MockService:
                     file = outer.files[fid]
                     if path.path.endswith("/slices"):
                         return self.send([{"id":fid * 10,"content":file["content"]}])
-                    return self.send({"id":fid,"status":-1 if outer.mode == "parse_failure" else 1,
+                    failed = outer.mode == "parse_failure" or (outer.mode == "complex_parse_failure" and file["filename"].startswith("complex_"))
+                    return self.send({"id":fid,"status":-1 if failed else 1,
                                       "created_at":1,"updated_at":2,"log":"fixture parser"})
                 return self.send({},404)
             def do_DELETE(self):
@@ -529,6 +532,32 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(self.service.kbs)
         self.assertTrue(any(s["result"].get("wiki") for s in report["answers"]["rows"][0]["response"]["sources"]))
         self.assertEqual(report["answers"]["rows"][1]["response"]["sources"],[])
+    def test_complex_cases_use_an_isolated_kb_and_clean_up_after_pass(self):
+        completed,report = self.run_cli(["--answer-categories","complex_reasoning","--cleanup","delete-on-pass"])
+        self.assertEqual(completed.returncode,0,completed.stdout + completed.stderr)
+        scopes = report["answers"]["fixture_scopes"]
+        self.assertNotEqual(scopes["complex"]["kb_id"],scopes["main"]["kb_id"])
+        self.assertEqual({r["kb_id"] for r in self.service.chat_requests},{scopes["complex"]["kb_id"]})
+        for file in self.service.files.values():
+            expected = "complex" if file["filename"].startswith("complex_") else "main"
+            self.assertEqual(file["kb_id"],scopes[expected]["kb_id"])
+        self.assertEqual(sum(f["filename"].startswith("complex_") for f in self.service.files.values()),7)
+        self.assertFalse(self.service.kbs)
+
+    def test_complex_fixture_failures_keep_all_planned_turns_without_calling_chat(self):
+        for mode in ["complex_parse_failure","complex_unsearchable"]:
+            with self.subTest(mode=mode):
+                self.service.mode = mode
+                completed,report = self.run_cli(["--answer-categories","complex_reasoning","--cleanup","delete"])
+                self.assertEqual(completed.returncode,1,completed.stdout + completed.stderr)
+                metrics = report["answers"]["metrics"]
+                self.assertEqual(metrics["planned_turns"],2)
+                self.assertEqual(metrics["completed_turns"],0)
+                self.assertEqual(metrics["judge_coverage"],0)
+                self.assertTrue(report["answers"]["fixture_scopes"]["complex"]["error"])
+                self.assertTrue(all(row["error"] for row in report["answers"]["rows"]))
+                self.assertFalse(self.service.chat_requests)
+                self.assertFalse(self.service.kbs)
     def test_invalid_manifest_fails_before_creating_any_knowledge_base(self):
         manifest = json.loads(answers.DEFAULT_CASES.read_text())
         manifest["cases"][0]["id"] = "../../escape"
@@ -646,16 +675,16 @@ class WebIntegrationTests(unittest.TestCase):
                 manager.start({"target":"localhost:11000","mode":"chat","judge_url":"https://untrusted.example/v1",
                                "judge_model":"model"})
 
-    def test_builtin_dataset_has_60_cases_70_turns_and_reproducible_facts(self):
+    def test_builtin_dataset_has_80_cases_100_turns_and_reproducible_facts(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
             args = harness.parse_args(["--mode","chat","--answer-seed","stable"])
             first = answers.prepare_suite(args,directory,"run-one",harness)
             second = answers.prepare_suite(args,directory,"run-two",harness)
-            self.assertEqual(len(first["cases"]),60)
-            self.assertEqual(sum(len(c["turns"]) for c in first["cases"]),70)
+            self.assertEqual(len(first["cases"]),80)
+            self.assertEqual(sum(len(c["turns"]) for c in first["cases"]),100)
             self.assertEqual(first["cases"],second["cases"])
-            self.assertEqual(len({c["category"] for c in first["cases"]}),6)
+            self.assertEqual(len({c["category"] for c in first["cases"]}),9)
 
 
 if __name__ == "__main__":

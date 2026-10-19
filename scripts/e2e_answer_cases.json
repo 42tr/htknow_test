@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "60 个答案评估用例：15 事实、10 汇总、10 无答案、10 多轮、5 Wiki、10 隔离与指令干扰。随机事实在运行时实例化；Wiki 页面由测试直接创建，只衡量 Wiki 证据使用，不衡量 Wiki 自动生成质量。",
+  "description": "80 个答案评估用例、100 轮请求：原有60个基线保持不变；新增10个复杂推理、5个部分可回答、5个三轮对话用例（30轮）。复杂用例使用独立知识库，覆盖版本生效、条件与例外、跨文档计算和关联、未知信息、多轮纠错与反事实恢复。随机事实在运行时实例化；Wiki页面由测试直接创建，不评估Wiki自动生成质量。",
   "documents": [
     {
       "id": "answer_plan",
@@ -37,6 +37,48 @@
       "scope": "wiki",
       "filename": "answer-wiki-original.txt",
       "content": "${wiki_project} 原文修订公告\n2027年1月2日发布的最新原文规定：容量上限为 ${wiki_current_capacity} 个任务。\n此前2026年12月1日发布的 Wiki 概览中写的是 ${wiki_capacity} 个任务，尚未同步更新。\n资料保留期限仍为 ${wiki_retention} 天，负责人仍为 ${wiki_owner}。\n本公告为最新原文，应优先用于回答当前有效容量。\n运行批次：${run_id}。"
+    },
+    {
+      "id": "complex_policy_current",
+      "scope": "complex",
+      "filename": "complex-policy_current.txt",
+      "content": "${complex_project} 上线规范 V2（已审批、生效版本）\n审批日期：2028年5月28日。生效日期：2028年6月1日。\n准入条件：副本数至少 ${min_replicas} 个，实测 P95 延迟不超过 ${latency_limit} 毫秒，实测错误率不超过 0.50%；三个条件必须同时满足，缺少测量数据不能判定全部达标。\n普通故障回滚时限：15分钟。P0事故优先适用例外条款，回滚时限为5分钟。\nV2仅从生效日起替代V1，不能用V2改写生效日前的历史要求。未审批的V3草案没有生效。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_policy_history",
+      "scope": "complex",
+      "filename": "complex-policy_history.txt",
+      "content": "${complex_project} 上线规范 V1（历史归档）\n生效日期：2028年4月1日。有效期截至2028年5月31日。\n历史准入条件：副本数至少2个，P95延迟不超过500毫秒，错误率不超过1.00%。\n普通故障回滚时限：30分钟。2028年6月1日起此版本被V2替代。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_policy_draft",
+      "scope": "complex",
+      "filename": "complex-policy_draft.txt",
+      "content": "${complex_project} 上线规范 V3（待审批草案）\n草案发布时间：2028年6月18日。审批状态：未审批；没有生效日期，尚未实施。\n提议普通故障回滚时限改为8分钟，P95延迟门槛改为100毫秒。\n这些数值只是提案，不能替代已生效版本的要求。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_acceptance",
+      "scope": "complex",
+      "filename": "complex-acceptance.txt",
+      "content": "${complex_project} 2028年6月20日实测验收记录\n订单服务：当前副本数 ${order_replicas} 个，实测P95延迟 ${observed_latency} 毫秒，实测错误率0.40%。\n报表服务：当前副本数 ${min_replicas} 个，实测P95延迟 ${observed_latency} 毫秒，实测错误率0.40%。\n搜索服务：当前副本数 ${min_replicas} 个，实测错误率0.40%；P95延迟尚未测量，没有实测数值。\n本记录只记录现状，不预先给出上线结论。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_contract",
+      "scope": "complex",
+      "filename": "complex-contract.txt",
+      "content": "${complex_project} 订单资源采购合同（已签署）\n计费单价：每副本每月 ${unit_price} 元。合同周期：${contract_months}个月。\n全部周期结算时有一次性抵扣 ${coupon} 元；抵扣只用一次，不能每月重复扣除。\n核算规则：每月费用为单价乘计划采购副本数；周期原价为每月费用乘合同月数；应付总额为周期原价减一次性抵扣。\n已核准的项目专项额度：${allowance}元。额度核准不代表资金已经到账，本记录未提供实际到账金额。\n合同没有记载提前解约违约金的比例。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_catalog",
+      "scope": "complex",
+      "filename": "complex-catalog.txt",
+      "content": "${complex_project} 服务目录与采购计划\n服务编码 ${order_code} 对应订单服务，属于交易域；订单服务计划采购副本数为 ${min_replicas} 个。\n服务编码 ${report_code} 对应报表服务，属于分析域。\n服务编码 ${search_code} 对应搜索服务，属于检索域。\n计划采购数量与验收记录中的当前实际数量是不同概念。\n运行批次：${run_id}。\n"
+    },
+    {
+      "id": "complex_runbook",
+      "scope": "complex",
+      "filename": "complex-runbook.txt",
+      "content": "${complex_project} 运维责任映射\n交易域运维负责人：${trade_owner}。\n分析域运维负责人：${report_owner}。\n检索域运维负责人：${search_owner}。\n备份间隔为2小时；未提供数据库RPO承诺，不能把备份间隔等同为RPO。\n本资料未登记紧急备用联系人。\n运行批次：${run_id}。\n"
     }
   ],
   "wiki_pages": [
@@ -1767,6 +1809,900 @@
         "${private_budget}"
       ],
       "require_empty_sources": true
+    },
+    {
+      "id": "reason-01",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_policy_history",
+        "complex_policy_draft"
+      ],
+      "turns": [
+        {
+          "question": "截至2028年6月20日，${complex_project} 正式有效的规范版本和普通故障回滚时限是什么？请结合审批和生效状态解释，不能只看发布时间。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "current_version",
+              "description": "2028年6月20日有效的已审批上线规范是V2，V3仍未审批。",
+              "aliases": [
+                "V2"
+              ]
+            },
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "较晚发布的V3只是未审批草案，V1已过期。不得采用草案8分钟或历史30分钟作为当前普通时限。"
+        }
+      ]
+    },
+    {
+      "id": "reason-02",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 当前遇到P0事故与普通故障时，回滚时限分别是多少？请说明哪项条款优先适用。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "p0",
+              "description": "P0事故例外时限为5分钟，优先于普通条款。",
+              "aliases": [
+                "5分钟",
+                "5 分钟"
+              ]
+            },
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "区分P0例外与普通规则；不要把所有故障统一套用15分钟。"
+        }
+      ]
+    },
+    {
+      "id": "reason-03",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_acceptance"
+      ],
+      "turns": [
+        {
+          "question": "按2028年6月20日实测，${complex_project} 的订单服务是否已满足全部上线门槛？请给出实际副本数、最低要求和结论。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "order_actual",
+              "description": "订单服务当前实际副本数为${order_replicas}个。",
+              "aliases": [
+                "${order_replicas}"
+              ]
+            },
+            {
+              "id": "minimum",
+              "description": "当前正式门槛要求副本数至少${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "not_ready",
+              "description": "订单服务副本数低于V2最低要求，不能判为满足全部上线门槛。",
+              "aliases": [
+                "不满足",
+                "不能上线"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "三项条件为AND关系，延迟与错误率合格不能抵消副本不足；使用实际副本而非计划采购量。"
+        }
+      ]
+    },
+    {
+      "id": "reason-04",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_policy_draft",
+        "complex_acceptance"
+      ],
+      "turns": [
+        {
+          "question": "按当前正式规范逐项检查 ${complex_project} 报表服务的副本数、P95延迟和错误率，给出是否达标的结论。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "report_actual",
+              "description": "报表服务当前实际副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "latency",
+              "description": "报表服务实测P95延迟为${observed_latency}毫秒。",
+              "aliases": [
+                "${observed_latency}"
+              ]
+            },
+            {
+              "id": "error_rate",
+              "description": "报表服务错误率0.40%，不超过正式门槛0.50%。",
+              "aliases": [
+                "0.40%",
+                "0.4%"
+              ]
+            },
+            {
+              "id": "ready",
+              "description": "报表服务三项实测同时符合V2要求，可以判为满足全部上线门槛。",
+              "aliases": [
+                "满足",
+                "可以上线"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "使用已生效V2门槛，不使用未审批草案100毫秒。必须逐项核对，不能只回答副本数。"
+        }
+      ]
+    },
+    {
+      "id": "reason-05",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_acceptance",
+        "complex_contract"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 的订单服务要满足副本门槛，最少还需增加几个副本？按合同单价，每月会增加多少费用？请给出依据和计算。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "extra_replicas",
+              "description": "至少增加${min_replicas}-${order_replicas}=1个副本。",
+              "aliases": [
+                "1个",
+                "1 个"
+              ]
+            },
+            {
+              "id": "extra_cost",
+              "description": "每月新增费用为1×${unit_price}=${unit_price}元。",
+              "aliases": [
+                "${unit_price}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "区分现状和计划；只计算新增资源的月费，不计全量副本或整个合同周期。"
+        }
+      ]
+    },
+    {
+      "id": "reason-06",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_contract",
+        "complex_catalog"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 按订单服务计划采购副本数计费，请分步计算每月费用、整个合同周期原价，以及只抵扣一次后的应付总额。每一步保留元单位和算式。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "monthly",
+              "description": "计划采购${min_replicas}个副本时，每月费用为${unit_price}×${min_replicas}=${monthly_cost}元。",
+              "aliases": [
+                "${monthly_cost}"
+              ]
+            },
+            {
+              "id": "subtotal",
+              "description": "合同${contract_months}个月的周期原价为${monthly_cost}×${contract_months}=${contract_subtotal}元。",
+              "aliases": [
+                "${contract_subtotal}"
+              ]
+            },
+            {
+              "id": "net",
+              "description": "一次性抵扣${coupon}元后，应付总额为${contract_subtotal}-${coupon}=${contract_net}元。",
+              "aliases": [
+                "${contract_net}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "使用计划数量，不能用当前验收数量；抵扣只用一次；每月、周期原价、应付金额均需回答。"
+        }
+      ]
+    },
+    {
+      "id": "reason-07",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_contract",
+        "complex_catalog"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 的核准专项额度能否覆盖订单资源整个合同的应付金额？请计算周期原价、一次性抵扣后的应付金额、剩余额度，并给出结论。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "subtotal",
+              "description": "合同${contract_months}个月的周期原价为${monthly_cost}×${contract_months}=${contract_subtotal}元。",
+              "aliases": [
+                "${contract_subtotal}"
+              ]
+            },
+            {
+              "id": "net",
+              "description": "一次性抵扣${coupon}元后，应付总额为${contract_subtotal}-${coupon}=${contract_net}元。",
+              "aliases": [
+                "${contract_net}"
+              ]
+            },
+            {
+              "id": "headroom",
+              "description": "剩余额度为${allowance}-${contract_net}=${headroom}元。",
+              "aliases": [
+                "${headroom}"
+              ]
+            },
+            {
+              "id": "within_allowance",
+              "description": "核准专项额度大于应付金额，可以覆盖本合同。",
+              "aliases": [
+                "可以覆盖",
+                "足够"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "按单价、计划副本数、合同月数计算，抵扣一次。只判断已核准额度是否足够，不推断资金已到账。"
+        }
+      ]
+    },
+    {
+      "id": "reason-08",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_catalog",
+        "complex_runbook"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 中服务编码 ${order_code} 对应哪个服务、属于哪个业务域，该业务域的运维负责人是谁？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "service",
+              "description": "${order_code}对应订单服务。",
+              "aliases": [
+                "订单服务"
+              ]
+            },
+            {
+              "id": "domain",
+              "description": "订单服务属于交易域。",
+              "aliases": [
+                "交易域"
+              ]
+            },
+            {
+              "id": "owner",
+              "description": "交易域运维负责人是${trade_owner}。",
+              "aliases": [
+                "${trade_owner}"
+              ],
+              "exact": true
+            }
+          ],
+          "citation_required": true,
+          "rubric": "需要通过编码到服务、服务到域、域到负责人三层关联，不能使用报表或搜索负责人。"
+        }
+      ]
+    },
+    {
+      "id": "reason-09",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_acceptance"
+      ],
+      "turns": [
+        {
+          "question": "在 ${complex_project} 的订单服务与报表服务两者中，哪些已经由实测证明满足全部正式上线门槛？请分别给结论，并说明两者出现不同结论的原因。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "not_ready",
+              "description": "订单服务副本数低于V2最低要求，不能判为满足全部上线门槛。",
+              "aliases": [
+                "不满足",
+                "不能上线"
+              ]
+            },
+            {
+              "id": "ready",
+              "description": "报表服务三项实测同时符合V2要求，可以判为满足全部上线门槛。",
+              "aliases": [
+                "满足",
+                "可以上线"
+              ]
+            },
+            {
+              "id": "difference",
+              "description": "两者延迟和错误率都符合门槛，差异在订单当前副本为${order_replicas}个而报表为${min_replicas}个，只有报表达到最低副本数。",
+              "aliases": [
+                "${order_replicas}",
+                "${min_replicas}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "只比较所问两个服务，不能因任一指标合格就宣布订单服务达标。"
+        }
+      ]
+    },
+    {
+      "id": "reason-10",
+      "category": "complex_reasoning",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_policy_history",
+        "complex_policy_draft"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 在2028年5月20日与2028年6月20日的普通故障回滚时限分别是多少？请给出各自有效版本以及发生变化的生效节点。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "historical",
+              "description": "2028年5月20日适用V1，普通故障回滚时限30分钟。",
+              "aliases": [
+                "30分钟",
+                "30 分钟"
+              ]
+            },
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            },
+            {
+              "id": "effective_date",
+              "description": "V2于2028年6月1日生效替代V1。",
+              "aliases": [
+                "2028年6月1日",
+                "2028-06-01"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "不能以最新版本覆盖历史，也不能将6月18日草案发布时间当作正式变更时间。"
+        }
+      ]
+    },
+    {
+      "id": "partial-01",
+      "category": "partial_answer",
+      "scope": "complex",
+      "required_docs": [
+        "complex_contract"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 订单资源的合同单价和提前解约违约金比例分别是多少？有依据的项请回答，没有依据的项明确说明。",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "unit_price",
+              "description": "订单资源每副本每月单价为${unit_price}元。",
+              "aliases": [
+                "${unit_price}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "单价可回答，违约金比例未记载；不能全部拒答，也不能根据常见合同猜测比例。"
+        }
+      ]
+    },
+    {
+      "id": "partial-02",
+      "category": "partial_answer",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_acceptance"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 搜索服务当前副本数和实测P95延迟分别是多少？能否据此确认全部上线门槛都满足？",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "search_replicas",
+              "description": "搜索服务当前副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "副本数已知，P95未测量，没有数值且无法确认全部达标；不能借用其他服务的延迟，也不能把缺失值当0。"
+        }
+      ]
+    },
+    {
+      "id": "partial-03",
+      "category": "partial_answer",
+      "scope": "complex",
+      "required_docs": [
+        "complex_catalog",
+        "complex_runbook"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 报表服务的运维负责人和紧急备用联系人分别是谁？",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "owner",
+              "description": "报表服务属于分析域，运维负责人是${report_owner}。",
+              "aliases": [
+                "${report_owner}"
+              ],
+              "exact": true
+            }
+          ],
+          "citation_required": true,
+          "rubric": "通过业务域映射回答负责人；备用联系人未登记，不能用其他业务域负责人代替。"
+        }
+      ]
+    },
+    {
+      "id": "partial-04",
+      "category": "partial_answer",
+      "scope": "complex",
+      "required_docs": [
+        "complex_contract"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 已核准的专项额度和实际到账金额分别是多少？",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "allowance",
+              "description": "项目已核准专项额度为${allowance}元。",
+              "aliases": [
+                "${allowance}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "额度核准不是到账证明，到账金额未提供；不得把两项写成同一个数，也不能全拒答。"
+        }
+      ]
+    },
+    {
+      "id": "partial-05",
+      "category": "partial_answer",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_runbook"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 当前正式规范下的普通回滚时限和数据库RPO各是多少？",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "普通回滚时限15分钟有资料，RPO未承诺；备份间隔2小时不是RPO，不能混同。"
+        }
+      ]
+    },
+    {
+      "id": "advanced-multi-01",
+      "category": "advanced_multi_turn",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_acceptance"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 的订单服务当前实际副本数和正式最低副本要求各是多少？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "order_actual",
+              "description": "订单服务当前实际副本数为${order_replicas}个。",
+              "aliases": [
+                "${order_replicas}"
+              ]
+            },
+            {
+              "id": "minimum",
+              "description": "当前正式门槛要求副本数至少${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": ""
+        },
+        {
+          "question": "不是订单，改看报表服务：它的当前副本数是多少，是否达到副本门槛？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "report_actual",
+              "description": "报表服务当前实际副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "replica_ready",
+              "description": "报表副本数达到V2最低要求。",
+              "aliases": [
+                "达到",
+                "满足"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "明确切换到报表服务，不得沿用订单实际数量。"
+        },
+        {
+          "question": "它的实测P95比正式门槛低多少毫秒？请同时给出实测值、门槛和差额计算。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "latency",
+              "description": "报表服务实测P95延迟为${observed_latency}毫秒。",
+              "aliases": [
+                "${observed_latency}"
+              ]
+            },
+            {
+              "id": "latency_limit",
+              "description": "V2的P95延迟上限为${latency_limit}毫秒。",
+              "aliases": [
+                "${latency_limit}"
+              ]
+            },
+            {
+              "id": "margin",
+              "description": "差额为${latency_limit}-${observed_latency}=15毫秒。",
+              "aliases": [
+                "15"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "它指上一轮切换后的报表服务，不能取草案100毫秒。"
+        }
+      ]
+    },
+    {
+      "id": "advanced-multi-02",
+      "category": "advanced_multi_turn",
+      "scope": "complex",
+      "required_docs": [
+        "complex_contract",
+        "complex_catalog"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 订单资源每副本每月的合同单价是多少？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "unit_price",
+              "description": "订单资源每副本每月单价为${unit_price}元。",
+              "aliases": [
+                "${unit_price}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": ""
+        },
+        {
+          "question": "按服务目录里的计划采购副本数，每月一共多少钱？请给计划数量和算式。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "planned",
+              "description": "计划采购副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "monthly",
+              "description": "计划采购${min_replicas}个副本时，每月费用为${unit_price}×${min_replicas}=${monthly_cost}元。",
+              "aliases": [
+                "${monthly_cost}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "沿用单价并重新检索计划数量，不能将当前实际副本数当采购数量。"
+        },
+        {
+          "question": "再算整个合同周期原价，并扣掉那项只使用一次的抵扣，最终应付多少？请分步写算式。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "subtotal",
+              "description": "合同${contract_months}个月的周期原价为${monthly_cost}×${contract_months}=${contract_subtotal}元。",
+              "aliases": [
+                "${contract_subtotal}"
+              ]
+            },
+            {
+              "id": "net",
+              "description": "一次性抵扣${coupon}元后，应付总额为${contract_subtotal}-${coupon}=${contract_net}元。",
+              "aliases": [
+                "${contract_net}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "同一合同，抵扣只用一次，不能每个月重复抵扣。"
+        }
+      ]
+    },
+    {
+      "id": "advanced-multi-03",
+      "category": "advanced_multi_turn",
+      "scope": "complex",
+      "required_docs": [
+        "complex_policy_current",
+        "complex_policy_history",
+        "complex_policy_draft"
+      ],
+      "turns": [
+        {
+          "question": "查 ${complex_project} 在2028年5月20日适用的普通故障回滚时限。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "historical",
+              "description": "该日V1有效，普通回滚时限30分钟。",
+              "aliases": [
+                "30分钟",
+                "30 分钟"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": ""
+        },
+        {
+          "question": "现在改查2028年6月20日，只按已经审批并生效的版本，普通故障回滚时限是多少？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": ""
+        },
+        {
+          "question": "所以那份发布时间更晚的V3草案已经正式生效了，对吗？请核对真正有效的版本号和普通回滚时限。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "current_version",
+              "description": "2028年6月20日有效的已审批上线规范是V2，V3仍未审批。",
+              "aliases": [
+                "V2"
+              ]
+            },
+            {
+              "id": "rollback",
+              "description": "V2普通故障回滚时限为15分钟。",
+              "aliases": [
+                "15分钟",
+                "15 分钟"
+              ]
+            },
+            {
+              "id": "draft_status",
+              "description": "V3仍未审批，没有生效，不能因为发布时间更晚而采用草案。",
+              "aliases": [
+                "未审批",
+                "未生效"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "纠正用户错误前提，不能顺从把V3的8分钟当已生效。"
+        }
+      ]
+    },
+    {
+      "id": "advanced-multi-04",
+      "category": "advanced_multi_turn",
+      "scope": "complex",
+      "required_docs": [
+        "complex_acceptance",
+        "complex_catalog",
+        "complex_runbook",
+        "complex_contract"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 搜索服务的实测P95延迟是多少？",
+          "expected_behavior": "abstain",
+          "facts": [],
+          "citation_required": false,
+          "rubric": "资料明确尚未测量；没有可回答的数值，应说明无法确认，不能借用订单或报表数据。"
+        },
+        {
+          "question": "那先给它的当前副本数和运维负责人。",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "search_replicas",
+              "description": "搜索服务当前副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "owner",
+              "description": "搜索属于检索域，运维负责人是${search_owner}。",
+              "aliases": [
+                "${search_owner}"
+              ],
+              "exact": true
+            }
+          ],
+          "citation_required": true,
+          "rubric": "上一轮数值未知不代表所有信息未知，应恢复回答有依据的事实。"
+        },
+        {
+          "question": "再同时给出这个项目的已核准专项额度，以及搜索服务实测P95延迟。",
+          "expected_behavior": "partial",
+          "facts": [
+            {
+              "id": "allowance",
+              "description": "项目已核准专项额度为${allowance}元。",
+              "aliases": [
+                "${allowance}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "额度有资料应回答；搜索P95仍未测量，不能因上一轮成功回答就补造延迟。"
+        }
+      ]
+    },
+    {
+      "id": "advanced-multi-05",
+      "category": "advanced_multi_turn",
+      "scope": "complex",
+      "required_docs": [
+        "complex_acceptance",
+        "complex_policy_current"
+      ],
+      "turns": [
+        {
+          "question": "${complex_project} 报表服务在验收记录里的实际副本数是多少？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "report_actual",
+              "description": "报表服务当前实际副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": ""
+        },
+        {
+          "question": "假设把它减少到${order_replicas}个副本，其他实测指标不变。只在这个假设下，它还能满足全部上线门槛吗？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "hypothetical_not_ready",
+              "description": "题设假设下${order_replicas}个副本低于最低${min_replicas}个，因此不满足全部准入条件。",
+              "aliases": [
+                "不满足",
+                "不能上线"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "这是明确的反事实假设，使用用户给定前提结合V2规则推导；不能声称文档记载报表实际已减少。"
+        },
+        {
+          "question": "回到文档事实，不沿用刚才的假设：报表服务实际副本数和上线结论各是什么？",
+          "expected_behavior": "answer",
+          "facts": [
+            {
+              "id": "report_actual",
+              "description": "报表服务当前实际副本数为${min_replicas}个。",
+              "aliases": [
+                "${min_replicas}"
+              ]
+            },
+            {
+              "id": "ready",
+              "description": "报表服务三项实测同时符合V2要求，可以判为满足全部上线门槛。",
+              "aliases": [
+                "满足",
+                "可以上线"
+              ]
+            }
+          ],
+          "citation_required": true,
+          "rubric": "恢复验收事实，不能把上一轮假设写回真实状态。"
+        }
+      ]
     }
   ]
 }

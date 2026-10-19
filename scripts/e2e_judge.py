@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.2"
+JUDGE_VERSION = "htknow-answer-v6.3"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -156,6 +156,9 @@ Statements just expressing uncertainty/refusal, headings and politeness are not
 factual claims. For example, "当前检索未找到该信息，无法回答" reports an
 information limitation: put it in information_limits, NOT claims, including when
 sources is empty. Each information_limits entry selects exactly ONE answer span.
+Do not also classify that same uncited span as a factual claim. If a span mixes
+a positive fact and a limitation, retain the positive claim and do not classify
+the entire span as an information limitation. Classification must be consistent.
 Do not invent an evidence quote or call an empty support array supported for a
 refusal. A definitive assertion such as "该项目没有预算" is a factual claim and
 still needs evidence. A refusal may contain additional positive factual claims;
@@ -218,6 +221,10 @@ Repeated facts still require review at each cited occurrence. Keep existing clai
 validation_feedback.additional_errors lists other invalid claims in the same
 result. Correct ALL listed issues in the single complete corrected JSON, including
 moving retrieval limitations from claims into information_limits.
+If validation_feedback reports a classification_conflict, inspect the immutable
+answer_quote: a pure information limitation belongs only in information_limits;
+a positive factual assertion must remain in claims with its actual citations,
+even when uncited. Remove the conflicting information_limits entry in that case.
 """
 
 
@@ -435,6 +442,7 @@ def validate_grounding(payload: Any, sources: List[Dict[str, Any]], answer: str,
 
     accounted_citations = set()
     limits = payload.get("information_limits", [])
+    limit_quotes = set()
     if not isinstance(limits, list):
         raise JudgeError("信息不足说明必须为数组")
     for index, limit in enumerate(limits):
@@ -442,6 +450,7 @@ def validate_grounding(payload: Any, sources: List[Dict[str, Any]], answer: str,
         if not isinstance(ids, list) or len(ids) != 1:
             raise JudgeError("每条信息不足说明必须定位一个答案片段")
         limit["answer_quote"] = _select_span(ids, spans, answer, path=f"information_limits[{index}].answer_span_ids")
+        limit_quotes.add(limit["answer_quote"])
         accounted_citations.update(citation_ids(limit["answer_quote"]))
     for index, item in enumerate(claims):
         if not isinstance(item, dict) or not isinstance(item.get("claim"), str) or not item["claim"].strip():
@@ -465,6 +474,13 @@ def validate_grounding(payload: Any, sources: List[Dict[str, Any]], answer: str,
                 raise JudgeError("证据引用格式无效")
             evidence["quote"] = evidence_quote(evidence, f"claims[{index}].support[{evidence_index}].quote", "source quote")
         attached = set(citation_ids(quote))
+        if not attached and quote in limit_quotes:
+            # Conflicting classifications require the same bounded model repair
+            # as other schema errors; never silently drop or exempt a claim.
+            raise JudgeError("同一无引用片段被重复判为事实与信息不足说明", details={
+                "path": f"claims[{index}].answer_span_ids", "answer_quote": quote,
+                "classification_conflict": True,
+                "hint": "Pure uncertainty belongs only in information_limits. Keep real positive facts in claims, including uncited facts."})
         supplied = set()
         aligned = []
         for citation_index, citation in enumerate(citations):
@@ -643,7 +659,9 @@ class Judge:
                                for source in data["sources"]]
                 for index, claim in enumerate(previous["claims"]):
                     try:
-                        validate_grounding({"claims": [copy.deepcopy(claim)]}, raw_sources, data["answer"], True)
+                        validate_grounding({"claims": [copy.deepcopy(claim)],
+                            "information_limits": copy.deepcopy(previous.get("information_limits", []))},
+                            raw_sources, data["answer"], True)
                     except JudgeError as problem:
                         if str(problem) == "证据评审遗漏回答中的引用":
                             continue  # A single-claim probe intentionally omits other claims.

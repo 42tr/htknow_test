@@ -205,6 +205,28 @@ def prepare_suite(args: Any, workdir: Path, run_id: str, harness: Any) -> Dict[s
         "wiki_retention": str(rng.randint(31, 99)),
     }
     values["wiki_current_capacity"] = str(int(values["wiki_capacity"]) + 127)
+    # Keep the original fixture RNG unchanged so existing seeds remain comparable.
+    complex_rng = random.Random("complex:" + seed)
+    minimum = complex_rng.randint(4, 7)
+    price = complex_rng.choice([1200, 1500, 1800, 2100])
+    months = complex_rng.choice([3, 4, 6])
+    coupon = complex_rng.choice([600, 900, 1200])
+    monthly = price * minimum
+    subtotal = monthly * months
+    net = subtotal - coupon
+    limit = complex_rng.choice([180, 200, 220])
+    allowance = net + complex_rng.choice([3000, 4500, 6000])
+    values.update({
+        "complex_project": "澄海-" + suffix, "order_code": "ORD-" + suffix,
+        "report_code": "RPT-" + suffix, "search_code": "SRCH-" + suffix,
+        "trade_owner": "程遥" + suffix[:3], "report_owner": "陆宁" + suffix[3:6],
+        "search_owner": "叶晴" + suffix[6:9], "min_replicas": str(minimum),
+        "order_replicas": str(minimum - 1), "latency_limit": str(limit),
+        "observed_latency": str(limit - 15), "latency_margin": "15",
+        "unit_price": str(price), "contract_months": str(months), "coupon": str(coupon),
+        "monthly_cost": str(monthly), "contract_subtotal": str(subtotal),
+        "contract_net": str(net), "allowance": str(allowance), "headroom": str(allowance - net),
+    })
     try:
         rendered = _render(manifest, values)
     except (KeyError, ValueError):
@@ -218,13 +240,13 @@ def prepare_suite(args: Any, workdir: Path, run_id: str, harness: Any) -> Dict[s
         if not isinstance(doc, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(doc.get("id", ""))) or doc["id"] in fixture_ids:
             raise AnswerError("答案题集文档 ID 无效或重复")
         fixture_ids.add(doc["id"])
-        if doc.get("scope", "main") not in ("main", "private", "wiki") or not isinstance(doc.get("content"), str) or not doc["content"].strip():
+        if doc.get("scope", "main") not in ("main", "private", "wiki", "complex") or not isinstance(doc.get("content"), str) or not doc["content"].strip():
             raise AnswerError("答案题集文档的 scope 或 content 无效")
     for case in cases:
         if not isinstance(case, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(case.get("id", ""))) or case["id"] in seen:
             raise AnswerError("答案题集用例 ID 无效或重复")
         seen.add(case["id"])
-        if case.get("scope", "main") not in ("main", "wiki", "denied") or not isinstance(case.get("category"), str) or not case["category"].strip():
+        if case.get("scope", "main") not in ("main", "wiki", "denied", "complex") or not isinstance(case.get("category"), str) or not case["category"].strip():
             raise AnswerError("答案题集用例的 scope 或 category 无效")
         kinds = case.get("required_source_kinds", [])
         if not isinstance(kinds, list) or not all(kind in ("original", "wiki") for kind in kinds):
@@ -297,6 +319,28 @@ def setup_scopes(suite: Dict[str, Any], args: Any, client: Any, harness: Any,
     scopes = suite["fixture_scopes"]
     scopes["main"] = {"kb_id": kb_id, "client": client, "error": None}
     cleanup = []
+    if any(c.get("scope") == "complex" for c in suite["cases"]):
+        scopes["complex"] = {"client": client, "kb_id": None, "error": None}
+        try:
+            complex_id, _ = harness.create_knowledge_base(client, "E2E复杂推理-" + suite["seed"],
+                                                         "版本、条件、计算与多轮对照", 90, False)
+            cleanup.append((client, complex_id))
+            scopes["complex"]["kb_id"] = complex_id
+            pairs = [p for p in suite["pairs"] if p["scope"] == "complex"]
+            harness.upload_and_wait(client, args, complex_id, [p["spec"] for p in pairs],
+                                    [p["record"] for p in pairs], workdir)
+            if not pairs or not all(p["record"].stage == "completed" and p["record"].slices > 0 for p in pairs):
+                raise AnswerError("复杂推理对照文档未成功解析")
+            deadline = time.monotonic() + min(args.parse_timeout, 30)
+            while True:
+                found, _ = harness.run_search(client, suite["private_values"]["complex_project"], complex_id)
+                if any(suite["private_values"]["complex_project"] in str(hit.get("content", "")) for hit in found):
+                    break
+                if time.monotonic() >= deadline:
+                    raise AnswerError("复杂推理对照文档无法检索")
+                time.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
+        except (harness.ApiFailure, harness.HarnessError, AnswerError) as exc:
+            scopes["complex"]["error"] = "复杂推理对照初始化失败：" + str(exc)[:300]
     if any(c.get("needs_private_fixture") or c.get("scope") == "denied" for c in suite["cases"]):
         owner = harness.Client(client.base_url, "e2e-owner-" + suite["private_values"]["project_code"],
                                "user", "e2e-private-owner", args.http_timeout, args.retries, args.insecure, False)
