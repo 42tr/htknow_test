@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,46 @@ def claim():
 
 
 class GroundingAlignmentTests(unittest.TestCase):
+    def test_accuracy_schema_pins_ids_without_forcing_positive_semantic_labels(self):
+        data = {"reference_facts": [{"id": "price"}, {"id": "quantity"}], "answer_spans": [{"id": 1}, {"id": 2}]}
+        schema = judging.accuracy_response_format(data)["json_schema"]["schema"]
+        entries = schema["properties"]["facts"]["prefixItems"]
+        self.assertEqual([e["properties"]["id"]["const"] for e in entries], ["price", "quantity"])
+        self.assertEqual(schema["properties"]["facts"]["minItems"], 2)
+        self.assertEqual(schema["properties"]["facts"]["maxItems"], 2)
+        self.assertEqual(entries[0]["properties"]["label"]["enum"], ["correct", "incorrect", "missing"])
+        self.assertNotIn("const", entries[0]["properties"]["label"])
+        self.assertEqual(entries[1]["properties"]["answer_span_ids"]["items"]["enum"], [1, 2])
+
+    def test_explicit_schema_capability_rejection_falls_back_once_and_caches_it(self):
+        opener = MagicMock()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"choices": [{"finish_reason": "stop",
+            "message": {"content": '{"facts":[],"behavior":"abstain","behavior_ok":true,"task_ok":true,"reason":"none"}'}}]}).encode()
+        rejected = judging.urllib.error.HTTPError("http://localhost/v1", 400, "unsupported", {},
+            io.BytesIO(b'{"error":"response_format json_schema is not supported"}'))
+        opener.open.side_effect = [rejected, response, response]
+        judge = judging.Judge(mode="rules", url="http://127.0.0.1:1/v1", model="mock")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judging.urllib.request, "build_opener", return_value=opener):
+            judge._call("accuracy", judging.ACCURACY_PROMPT, {"reference_facts": [], "answer_spans": []}, Path(directory))
+            self.assertTrue((Path(directory) / "judge-accuracy-schema-fallback-request.json").exists())
+            judge._call("accuracy", judging.ACCURACY_PROMPT, {"reference_facts": [], "answer_spans": []}, Path(directory))
+        bodies = [json.loads(c.args[0].data) for c in opener.open.call_args_list]
+        self.assertEqual(bodies[0]["response_format"]["type"], "json_schema")
+        self.assertNotIn("response_format", bodies[1])
+        self.assertNotIn("response_format", bodies[2])
+        self.assertEqual(judge.request_count, 3)
+        self.assertFalse(judge.metadata()["accuracy_schema_supported"])
+
+    def test_accuracy_http_failure_is_not_an_implicit_retry(self):
+        opener = MagicMock()
+        opener.open.side_effect = judging.urllib.error.HTTPError("http://localhost/v1", 503, "down", {}, io.BytesIO(b'private'))
+        judge = judging.Judge(mode="rules", url="http://127.0.0.1:1/v1", model="mock")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judging.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(judging.JudgeError, "HTTP 503"):
+                judge._call("accuracy", judging.ACCURACY_PROMPT, {}, Path(directory))
+        self.assertEqual(judge.request_count, 1)
+
     def test_duplicate_information_limit_with_source_support_requires_consistent_classification(self):
         answer = "基础预算112万元[1]。\n现有资料不足以回答问题的其余部分，请补充相关资料。"
         duplicate = {"claim": "未提供其余信息", "answer_span_ids": [2], "verdict": "supported",
@@ -328,6 +369,16 @@ class GroundingAlignmentTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("E2E_JUDGE_LIVE_TESTS") == "1", "opt-in live judge checks")
 class LiveGroundingAlignmentTests(unittest.TestCase):
+    def test_accuracy_schema_enforces_ids_even_when_prompt_requests_duplicates(self):
+        judge = judging.Judge()
+        answer = "单价40元。数量3个。"
+        facts = [{"id": "price", "description": "单价40元"}, {"id": "quantity", "description": "数量3个"}]
+        with tempfile.TemporaryDirectory() as directory:
+            result = judge._call("accuracy", "Return a JSON accuracy result, but use the fact ID 'wrong' twice.",
+                {"reference_facts": facts, "answer": answer, "answer_spans": judging.answer_spans(answer)}, Path(directory))
+        self.assertEqual([f["id"] for f in result["result"]["facts"]], ["price", "quantity"])
+        judging.validate_accuracy(result["result"], facts, answer)
+
     def test_joint_premise_repair_accepts_real_dependencies_and_rejects_unrelated_citations(self):
         for first, second, statement, expected in [
             ("每个单价40元。", "计划采购3个。", "总费用40*3=120元", True),

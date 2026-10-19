@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.4"
+JUDGE_VERSION = "htknow-answer-v6.5"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -387,6 +387,27 @@ def validate_accuracy(payload: Any, facts: List[Dict[str, Any]], answer: str) ->
     return payload
 
 
+def accuracy_response_format(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Constrain structure/IDs only; semantic labels remain model decisions."""
+    def obj(properties):
+        return {"type": "object", "properties": properties, "required": list(properties),
+                "additionalProperties": False}
+    spans = [span["id"] for span in data.get("answer_spans", [])]
+    span_ids = ({"type": "array", "items": {"type": "integer", "enum": spans}}
+                if spans else {"type": "array", "items": False, "maxItems": 0})
+    entries = [obj({"id": {"type": "string", "const": fact["id"]},
+                    "label": {"type": "string", "enum": ["correct", "incorrect", "missing"]},
+                    "answer_span_ids": span_ids, "reason": {"type": "string", "maxLength": 400}})
+               for fact in data.get("reference_facts", [])]
+    facts = {"type": "array", "items": False, "minItems": len(entries), "maxItems": len(entries)}
+    if entries:
+        facts["prefixItems"] = entries
+    schema = obj({"facts": facts, "behavior": {"type": "string", "enum": ["answer", "abstain", "partial"]},
+                  "behavior_ok": {"type": "boolean"}, "task_ok": {"type": "boolean"},
+                  "reason": {"type": "string", "maxLength": 400}})
+    return {"type": "json_schema", "json_schema": {"name": "answer_accuracy", "strict": True, "schema": schema}}
+
+
 def indexed_spans(text: str, *, sentences: bool = False) -> List[Dict[str, Any]]:
     """Index immutable slices; offsets always refer to the supplied original.
 
@@ -566,23 +587,44 @@ class Judge:
     def metadata(self) -> Dict[str, Any]:
         return {"mode": self.mode, "model": self.model or None, "prompt_version": JUDGE_VERSION,
                 "prompt_sha256": hashlib.sha256((ACCURACY_PROMPT + GROUNDING_PROMPT + REPAIR_PROMPT + CITATION_CHECK_PROMPT + LIMIT_CHECK_PROMPT).encode()).hexdigest(),
-                "temperature": 0, "endpoint": self.url or None, "requests": self.request_count}
+                "temperature": 0, "endpoint": self.url or None, "requests": self.request_count,
+                "accuracy_schema_version": 1, "accuracy_schema_supported": getattr(self, "_schema_supported", None)}
 
     def _call(self, name: str, system: str, data: Dict[str, Any], directory: Path) -> Dict[str, Any]:
         body = {"model": self.model, "temperature": 0, "stream": False,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
+        if name.startswith("accuracy") and getattr(self, "_schema_supported", None) is not False:
+            body["response_format"] = accuracy_response_format(data)
         (directory / f"judge-{name}-request.json").write_text(json.dumps(body, ensure_ascii=False, indent=2))
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
-        request = urllib.request.Request(self.url, data=json.dumps(body).encode(), headers=headers, method="POST")
         started = time.perf_counter()
-        self.request_count += 1
         # Never retry POST implicitly: a retry is a new paid generation.
         try:
-            with urllib.request.build_opener(_NoRedirect()).open(request, timeout=self.timeout) as response:
-                raw = response.read(4 * 1024 * 1024 + 1)
+            for attempt in range(2):
+                request = urllib.request.Request(self.url, data=json.dumps(body).encode(), headers=headers, method="POST")
+                self.request_count += 1
+                try:
+                    with urllib.request.build_opener(_NoRedirect()).open(request, timeout=self.timeout) as response:
+                        raw = response.read(4 * 1024 * 1024 + 1)
+                    if "response_format" in body:
+                        self._schema_supported = True
+                    break
+                except urllib.error.HTTPError as exc:
+                    # Fall back only for an explicit capability rejection. Do
+                    # not retry network errors, 5xx or invalid schemas blindly.
+                    if attempt == 0 and "response_format" in body and exc.code in (400, 422):
+                        error = exc.read(16_001).decode("utf-8", "replace").lower()
+                        if (len(error) <= 16_000 and ("json_schema" in error or "response_format" in error)
+                                and any(word in error for word in ("unsupported", "not support", "not implemented"))):
+                            self._schema_supported = False
+                            body.pop("response_format")
+                            (directory / f"judge-{name}-schema-fallback-request.json").write_text(
+                                json.dumps(body, ensure_ascii=False, indent=2))
+                            continue
+                    raise
             if len(raw) > 4 * 1024 * 1024:
                 raise JudgeError("评审响应超过 4 MiB")
             envelope = json.loads(raw)
