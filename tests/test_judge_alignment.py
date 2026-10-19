@@ -25,6 +25,15 @@ def claim():
 
 
 class GroundingAlignmentTests(unittest.TestCase):
+    def test_citation_repair_retains_question_for_minimum_quantity_context(self):
+        data = {"question":"达到门槛至少增加几个，以及对应的新增费用？", "answer":"至少增加1个的费用为40元[1][2]。",
+                "sources":judging.visible_sources([SOURCE, {"id":2,"result":{"content":"当前副本3个，要求至少4个。"}}])}
+        item = {"claim":"新增费用40元", "answer_span_ids":[1], "citations":[]}
+        checks = judging.Judge(mode="rules")._citation_checks({"claims":[item]}, data)
+        self.assertTrue(checks)
+        self.assertTrue(all(c["question"] == data["question"] for c in checks))
+        self.assertTrue(all("history" not in c for c in checks))
+
     def test_same_cited_source_can_supply_several_premises_without_duplicate_citation_counts(self):
         item = claim()
         item["claim"] = "两项经费有不同数值"
@@ -450,7 +459,7 @@ class LiveGroundingAlignmentTests(unittest.TestCase):
                     {"answer": answer, "sources": judging.visible_sources(sources)}, Path(directory),
                     lambda p: judging.validate_grounding(p, sources, answer, True))
             citations = result["result"]["claims"][0]["citations"]
-            self.assertEqual(next(c["supported"] for c in citations if c["source_id"] == 2), expected)
+            self.assertEqual(next(c["supported"] for c in citations if c["source_id"] == 2), expected, statement)
 
     def classify_without_evidence(self, answer, should_exempt):
         judge = judging.Judge()

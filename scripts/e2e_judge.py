@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.7"
+JUDGE_VERSION = "htknow-answer-v6.8"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -194,7 +194,11 @@ need the quantity source; a total calculated from price AND quantity needs both.
 For an owner reached via service -> team -> owner, both mapping sources are
 necessary; a document merely mentioning the same project is not.
 answer_quote is citation attachment context; judge the listed atomic claim, not
-every other assertion sharing that span. Never use general knowledge. Return every
+every other assertion sharing that span. Never use general knowledge.
+question may be empty; still judge the literal claim. When present, use it only
+to resolve references and the minimum/conditional target, never as source evidence.
+For minimum additional cost, the additional quantity needs the cited threshold
+and observation even when the answer abbreviates it to 'add 1'. Return every
 check id exactly once. supported must be boolean. When true select passage_ids
 from this check's source; when false use []. A matching generic material label
 (e.g. 运维参数表 versus Wiki 参数概览) is allowed if the actual facts match.
@@ -720,6 +724,7 @@ class Judge:
             attached = set(citation_ids(quote))
             for sid in sorted(attached - supplied):
                 checks.append({"id": f"{index}:{sid}", "claim_index": index, "source_id": sid,
+                               "question": data.get("question", ""),
                                "claim": claim["claim"], "answer_quote": quote,
                                "other_cited_sources": [sources[other] for other in sorted(attached - {sid})
                                                        if other in sources],
