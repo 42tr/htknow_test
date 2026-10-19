@@ -251,6 +251,55 @@ class GroundingAlignmentTests(unittest.TestCase):
         self.assertEqual(result["repair"]["method"], "citation_checks")
         self.assertEqual(call.call_args_list[1].args[2]["checks"][0]["source"]["id"], 1)
 
+    def test_joint_premise_repair_receives_only_other_attached_raw_sources(self):
+        for first, second, statement in [
+            ("每个单价40元。", "计划采购3个。", "总费用40*3=120元"),
+            ("服务A归属团队B。", "团队B的负责人为陈宁。", "服务A的负责人为陈宁"),
+        ]:
+            sources = [{"id": 1, "result": {"content": first}},
+                       {"id": 2, "result": {"content": second}},
+                       {"id": 3, "result": {"content": "UNREFERENCED_SOURCE_MUST_STAY_OUT"}}]
+            answer = statement + "[1][2]。"
+            item = {"claim": statement, "answer_span_ids": [1], "verdict": "supported",
+                    "support": [{"source_id": 1, "passage_ids": [1]}, {"source_id": 2, "passage_ids": [1]}],
+                    "citations": [{"source_id": 1, "supported": True, "passage_ids": [1]}]}
+            judge = judging.Judge(mode="rules")
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(judge, "_call", side_effect=[
+                        {"result": {"claims": [item]}, "usage": None, "elapsed_ms": 1},
+                        {"result": {"checks": [{"id": "0:2", "supported": True, "passage_ids": [1]}]},
+                         "usage": None, "elapsed_ms": 1},
+                    ]) as call:
+                result = judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                    {"answer": answer, "sources": judging.visible_sources(sources)}, Path(directory),
+                    lambda p: judging.validate_grounding(p, sources, answer, True))
+            check = call.call_args_list[1].args[2]["checks"][0]
+            self.assertEqual(check["source"]["id"], 2)
+            self.assertEqual([s["id"] for s in check["other_cited_sources"]], [1])
+            self.assertEqual(check["other_cited_sources"][0]["content"], first)
+            self.assertNotIn("UNREFERENCED", json.dumps(check))
+            self.assertTrue(all(c["supported"] for c in result["result"]["claims"][0]["citations"]))
+            self.assertEqual(result["result"]["claims"][0]["citations"][1]["quote"], second)
+
+    def test_joint_context_does_not_turn_an_unrelated_quantity_citation_into_price_evidence(self):
+        sources = [{"id": 1, "result": {"content": "单价40元。"}},
+                   {"id": 2, "result": {"content": "计划采购3个。"}}]
+        answer = "单价40元[1][2]。"
+        item = {"claim": "单价40元", "answer_span_ids": [1], "verdict": "supported",
+                "support": [{"source_id": 1, "passage_ids": [1]}],
+                "citations": [{"source_id": 1, "supported": True, "passage_ids": [1]}]}
+        judge = judging.Judge(mode="rules")
+        with tempfile.TemporaryDirectory() as directory, patch.object(judge, "_call", side_effect=[
+            {"result": {"claims": [item]}, "usage": None, "elapsed_ms": 1},
+            {"result": {"checks": [{"id": "0:2", "supported": False, "passage_ids": []}]},
+             "usage": None, "elapsed_ms": 1},
+        ]) as call:
+            result = judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                {"answer": answer, "sources": judging.visible_sources(sources)}, Path(directory),
+                lambda p: judging.validate_grounding(p, sources, answer, True))
+        self.assertEqual(call.call_args_list[1].args[2]["checks"][0]["other_cited_sources"][0]["id"], 1)
+        self.assertFalse(result["result"]["claims"][0]["citations"][1]["supported"])
+
     def test_targeted_repair_rejects_omitted_checks_and_invalid_evidence(self):
         judge = judging.Judge(mode="rules")
         answer = "基础预算112万元[1]。"
@@ -279,6 +328,31 @@ class GroundingAlignmentTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("E2E_JUDGE_LIVE_TESTS") == "1", "opt-in live judge checks")
 class LiveGroundingAlignmentTests(unittest.TestCase):
+    def test_joint_premise_repair_accepts_real_dependencies_and_rejects_unrelated_citations(self):
+        for first, second, statement, expected in [
+            ("每个单价40元。", "计划采购3个。", "总费用40*3=120元", True),
+            ("服务A归属团队B。", "团队B的负责人为陈宁。", "服务A的负责人为陈宁", True),
+            ("每个单价40元。", "计划采购3个。", "每个单价为40元", False),
+        ]:
+            sources = [{"id": 1, "result": {"content": first}}, {"id": 2, "result": {"content": second}}]
+            answer = statement + "[1][2]。"
+            item = {"claim": statement, "answer_span_ids": [1], "verdict": "supported",
+                    "support": [{"source_id": 1, "passage_ids": [1]}],
+                    "citations": [{"source_id": 1, "supported": True, "passage_ids": [1]}]}
+            judge = judging.Judge()
+            real_call = judge._call
+            def call(name, prompt, data, directory):
+                if name == "grounding":
+                    return {"result": {"claims": [copy.deepcopy(item)]}, "usage": None, "elapsed_ms": 0}
+                return real_call(name, prompt, data, directory)
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(judge, "_call", side_effect=call):
+                result = judge._validated_call("grounding", judging.GROUNDING_PROMPT,
+                    {"answer": answer, "sources": judging.visible_sources(sources)}, Path(directory),
+                    lambda p: judging.validate_grounding(p, sources, answer, True))
+            citations = result["result"]["claims"][0]["citations"]
+            self.assertEqual(next(c["supported"] for c in citations if c["source_id"] == 2), expected)
+
     def classify_without_evidence(self, answer, should_exempt):
         judge = judging.Judge()
         real_call = judge._call
