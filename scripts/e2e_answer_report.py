@@ -226,9 +226,16 @@ def render_case(row: Dict[str, Any], key: str, active: bool) -> str:
     note = "已生成回答，但评审未完成；本轮不能作为语义验收通过的依据。" if state == "judge" else ""
     out.append(f'<div class="ar-diagnosis ar-{STATES[state][0]}"><strong>{esc(row.get("diagnosis") or STATES[state][1])}</strong>'
                f'{"<p>" + esc(note) + "</p>" if note else ""}</div>')
+    answer_html = prose(response.get("answer"), sources)
+    if not (response.get("answer") or "").strip():
+        error = str(response.get("error") or row.get("error") or "")
+        if "未通过来源核验" in error:
+            answer_html = '<p class="ar-empty-note">答案未通过来源核验，服务未输出正文。</p>'
+        elif error:
+            answer_html = '<p class="ar-empty-note">回答未完成，请查看上方错误原因。</p>'
     out.append('<div class="ar-comparison"><section class="ar-answer"><div class="ar-section-heading"><h3>模型回答</h3>'
                f'<span class="ar-muted">总耗时 {elapsed(response.get("elapsed_ms"))}</span></div>'
-               f'<div class="ar-prose">{prose(response.get("answer"), sources)}</div>'
+               f'<div class="ar-prose">{answer_html}</div>'
                f'<p class="ar-answer-meta">首段文本 {elapsed(response.get("first_text_ms"))} · {len(sources)} 个证据来源</p></section>')
     out.append('<section class="ar-reference"><div class="ar-section-heading"><h3>参考答案要点</h3>'
                f'<span class="ar-muted">{"应拒答 / 说明信息不足" if row.get("expected_behavior") == "abstain" else "应基于证据回答"}</span></div>')
