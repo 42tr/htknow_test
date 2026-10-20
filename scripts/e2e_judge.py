@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-JUDGE_VERSION = "htknow-answer-v6.8"
+JUDGE_VERSION = "htknow-answer-v6.9"
 CITATION_RE = re.compile(r"\[([1-9]\d*)\](?!\()")
 
 
@@ -130,7 +130,15 @@ relation, a source is valid when it provides a NECESSARY premise of the joint
 proof using the attached sources; it need not independently entail the conclusion.
 The answer (including earlier computed totals) is NEVER evidence. Trace each
 derived claim back to raw source numbers/relations, even if a preceding answer
-span already calculated an intermediate result. An unrelated source remains
+span already calculated an intermediate result. A calculated result and its
+attached raw-number formula are ONE proposition: do not replace 1500*7*3-1200
+with 31500-1200 and then treat 31500 as an independently established premise.
+Keep every explicit operand's source dependency in the claim and support.
+Retain explicit entity qualifications too: '订单服务所属交易域的最低要求为7'
+also asserts the service -> domain mapping; the catalog proving that relation
+contributes even when the policy alone contains the number 7. A claim that only
+states a policy's threshold does not need a service catalog.
+An unrelated source remains
 false: topic overlap or evidence for a different atomic claim is insufficient.
 Evidence in another source never repairs an irrelevant citation attached here.
 For unsupported claims still list all attached citation numbers with supported:
@@ -194,7 +202,19 @@ need the quantity source; a total calculated from price AND quantity needs both.
 For an owner reached via service -> team -> owner, both mapping sources are
 necessary; a document merely mentioning the same project is not.
 answer_quote is citation attachment context; judge the listed atomic claim, not
-every other assertion sharing that span. Never use general knowledge.
+every other assertion sharing that span. However, a formula attached to this
+calculated result is part of the SAME proposition, not neighboring context.
+literal_calculations contains exact formula attachments copied from answer_quote.
+Use those raw operands when assessing this calculated result, even if the claim
+paraphrase abbreviates it to an intermediate total. Never accept the intermediate
+total as evidence; reconstruct it using raw sources. For 1500*7*3-1200, the
+quantity source providing 7 is necessary at every step, including the final net.
+For a separate direct unit-price fact the quantity source remains unrelated.
+Likewise preserve explicit entity qualifications in the claim: a service's domain
+membership requires its catalog relation as well as any domain-specific policy.
+Do not mark a necessary relation false merely because it is not the primary
+source of the numeric threshold. A generic threshold without that relation does
+not need a catalog. Never use general knowledge.
 question may be empty; still judge the literal claim. When present, use it only
 to resolve references and the minimum/conditional target, never as source evidence.
 For minimum additional cost, the additional quantity needs the cited threshold
@@ -726,6 +746,7 @@ class Judge:
                 checks.append({"id": f"{index}:{sid}", "claim_index": index, "source_id": sid,
                                "question": data.get("question", ""),
                                "claim": claim["claim"], "answer_quote": quote,
+                               "literal_calculations": re.findall(r"（计算[：:]([^）]+)）", quote),
                                "other_cited_sources": [sources[other] for other in sorted(attached - {sid})
                                                        if other in sources],
                                "source": sources.get(sid, {"id": sid, "kind": "missing", "content": "", "passages": []})})

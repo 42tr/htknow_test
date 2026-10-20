@@ -25,6 +25,14 @@ def claim():
 
 
 class GroundingAlignmentTests(unittest.TestCase):
+    def test_citation_repair_preserves_literal_raw_formulas_when_claim_abbreviates_an_intermediate(self):
+        answer="合同周期原价31500元（计算：1500*7*3=31500元）[1][2]。"
+        sources=judging.visible_sources([{"id":1,"result":{"content":"单价1500元。合同3个月。"}},
+            {"id":2,"result":{"content":"计划采购7个。"}}])
+        item={"claim":"周期原价为10500乘3得到31500元","answer_span_ids":[1],"citations":[]}
+        checks=judging.Judge(mode="rules")._citation_checks({"claims":[item]},{"answer":answer,"sources":sources})
+        self.assertTrue(all(c["literal_calculations"]==["1500*7*3=31500元"] for c in checks))
+        self.assertTrue(all("history" not in c for c in checks))
     def test_citation_repair_retains_question_for_minimum_quantity_context(self):
         data = {"question":"达到门槛至少增加几个，以及对应的新增费用？", "answer":"至少增加1个的费用为40元[1][2]。",
                 "sources":judging.visible_sources([SOURCE, {"id":2,"result":{"content":"当前副本3个，要求至少4个。"}}])}
@@ -416,6 +424,31 @@ class GroundingAlignmentTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("E2E_JUDGE_LIVE_TESTS") == "1", "opt-in live judge checks")
 class LiveGroundingAlignmentTests(unittest.TestCase):
+    def test_expanded_calculations_and_qualified_relations_keep_raw_dependencies(self):
+        contract="单价1500元。合同周期3个月。一次性抵扣1200元。"
+        cases=[
+            (contract,"计划采购7个。","周期原价31500元（计算：1500*7*3=31500元）","周期原价为10500乘3得到31500元",1,2,True),
+            (contract,"计划采购7个。","最终应付30300元（计算：1500*7*3-1200=30300元）","应付金额为31500减1200得到30300元",1,2,True),
+            ("订单服务属于交易域。","交易域正式最低副本数至少7个。","订单服务所属交易域的最低副本要求为至少7个","订单服务所属交易域的最低副本要求为至少7个",2,1,True),
+            (contract,"计划采购7个。","每副本单价为1500元","每副本单价为1500元",1,2,False),
+            ("实测验收日期2028年6月20日。","V2生效日期2028年6月1日。","V2的生效日期为2028年6月1日","V2的生效日期为2028年6月1日",2,1,False),
+            ("订单服务属于交易域。","正式最低副本要求为至少7个。","正式最低副本要求为至少7个","正式最低副本要求为至少7个",2,1,False),
+        ]
+        for first,second,statement,paraphrase,known,checked,expected in cases:
+            sources=[{"id":1,"result":{"content":first}},{"id":2,"result":{"content":second}}]
+            answer=statement+"[1][2]。"
+            item={"claim":paraphrase,"answer_span_ids":[1],"verdict":"supported",
+                "support":[{"source_id":known,"passage_ids":[1]}],"citations":[{"source_id":known,"supported":True,"passage_ids":[1]}]}
+            judge=judging.Judge();real_call=judge._call
+            def call(name,prompt,data,directory):
+                if name=="grounding":return {"result":{"claims":[copy.deepcopy(item)]},"usage":None,"elapsed_ms":0}
+                return real_call(name,prompt,data,directory)
+            with self.subTest(statement=statement),tempfile.TemporaryDirectory() as directory,patch.object(judge,"_call",side_effect=call):
+                result=judge._validated_call("grounding",judging.GROUNDING_PROMPT,
+                    {"answer":answer,"sources":judging.visible_sources(sources)},Path(directory),
+                    lambda p:judging.validate_grounding(p,sources,answer,True))
+            actual=next(c["supported"] for c in result["result"]["claims"][0]["citations"] if c["source_id"]==checked)
+            self.assertEqual(actual,expected,statement)
     def test_accuracy_schema_handles_empty_reference_facts(self):
         judge = judging.Judge()
         answer = "当前资料不足，无法确认。"
