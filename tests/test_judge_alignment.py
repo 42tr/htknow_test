@@ -26,13 +26,18 @@ def claim():
 
 class GroundingAlignmentTests(unittest.TestCase):
     def test_citation_repair_preserves_literal_raw_formulas_when_claim_abbreviates_an_intermediate(self):
-        answer="合同周期原价31500元（计算：1500*7*3=31500元）[1][2]。"
+        answer="合同周期原价31500元（计算：10500*3=31500元）（计算：1500*7*3=31500元）[1][2]。"
         sources=judging.visible_sources([{"id":1,"result":{"content":"单价1500元。合同3个月。"}},
             {"id":2,"result":{"content":"计划采购7个。"}}])
         item={"claim":"周期原价为10500乘3得到31500元","answer_span_ids":[1],"citations":[]}
         checks=judging.Judge(mode="rules")._citation_checks({"claims":[item]},{"answer":answer,"sources":sources})
-        self.assertTrue(all(c["literal_calculations"]==["1500*7*3=31500元"] for c in checks))
+        self.assertTrue(all(c["literal_calculations"]==["1500*7*3=31500元","10500*3=31500元"] for c in checks))
         self.assertTrue(all("history" not in c for c in checks))
+
+    def test_bare_and_parenthesized_math_is_preserved_without_inventing_formulas_for_direct_values(self):
+        self.assertEqual(judging.literal_calculations("总费用40*3=120元[1][2]。"),["40*3=120元"])
+        self.assertEqual(judging.literal_calculations("剩余33300-(1500*7*3-1200)=3000元"),["33300-(1500*7*3-1200)=3000元"])
+        self.assertEqual(judging.literal_calculations("单价1500元。2028年6月1日生效。"),[])
     def test_citation_repair_retains_question_for_minimum_quantity_context(self):
         data = {"question":"达到门槛至少增加几个，以及对应的新增费用？", "answer":"至少增加1个的费用为40元[1][2]。",
                 "sources":judging.visible_sources([SOURCE, {"id":2,"result":{"content":"当前副本3个，要求至少4个。"}}])}
@@ -90,6 +95,54 @@ class GroundingAlignmentTests(unittest.TestCase):
         self.assertEqual(checks[1]["properties"]["passage_ids"]["maxItems"], 0)
         self.assertNotIn("const", checks[0]["properties"]["supported"])
         self.assertEqual(schema["information_limit_checks"]["prefixItems"][0]["properties"]["claim_index"]["const"], 4)
+
+    def test_counterfactual_citation_support_distinguishes_necessary_premises_and_unrelated_sources(self):
+        for own,joint,other,expected in [(False,True,False,True),(False,True,True,False),
+                (True,True,True,True),(False,False,False,False)]:
+            self.assertEqual(judging.citation_support(dict(source_alone_supported=own,
+                joint_supported=joint,other_sources_supported=other)),expected)
+        with self.assertRaises(judging.JudgeError):
+            judging.citation_support(dict(source_alone_supported=True,joint_supported=False,other_sources_supported=False))
+        with self.assertRaises(judging.JudgeError):
+            judging.citation_support(dict(source_alone_supported=False))
+
+    def test_counterfactual_proofs_isolate_source_sets_and_reject_unrelated_quantity(self):
+        sources=judging.visible_sources([{"id":1,"result":{"content":"单价40元。"}},
+            {"id":2,"result":{"content":"数量3个。"}}])
+        for statement,expected in [("总费用40*3=120元",True),("单价40元",False)]:
+            check={"id":"0:2","claim":statement,"answer_quote":statement+"[1][2]。",
+                "source_id":2,"source":sources[1],"other_cited_sources":[sources[0]],
+                "literal_calculations":judging.literal_calculations(statement)}
+            seen=[]
+            def call(name,prompt,data,directory):
+                ids={s["id"] for s in data["sources"]};seen.append(ids)
+                supported=ids=={1,2} if expected else 1 in ids
+                used=[{"source_id":i,"passage_ids":[1]} for i in sorted(ids)] if supported else []
+                return {"result":{"supported":supported,"used_evidence":used,"reason":"proof"},"usage":None}
+            judge=judging.Judge(mode="rules")
+            with tempfile.TemporaryDirectory() as directory,patch.object(judge,"_call",side_effect=call):
+                result=judge._citation_counterfactual("repair",judging.CITATION_CHECK_PROMPT,{"checks":[check]},Path(directory))
+            self.assertEqual(seen,[{2},{1,2},{1}])
+            self.assertEqual(result["result"]["checks"][0]["supported"],expected)
+
+    def test_citation_proof_cannot_use_a_source_outside_its_isolated_scope(self):
+        source=judging.visible_sources([SOURCE])[0]
+        check={"id":"0:1","claim":"预算112万元","answer_quote":"预算112万元[1]。",
+            "source_id":1,"source":source,"other_cited_sources":[]}
+        invalid={"result":{"supported":True,"used_evidence":[{"source_id":99,"passage_ids":[1]}]},"usage":None}
+        judge=judging.Judge(mode="rules")
+        with tempfile.TemporaryDirectory() as directory,patch.object(judge,"_call",return_value=invalid),self.assertRaises(judging.JudgeError):
+            judge._citation_counterfactual("repair",judging.CITATION_CHECK_PROMPT,{"checks":[check]},Path(directory))
+
+    def test_literal_formula_is_added_only_for_its_result_and_not_a_neighboring_atomic_fact(self):
+        quote="周期原价31500元（计算：1500*7*3=31500元）[1][2]。"
+        check={"claim":"周期原价31500元","answer_quote":quote,"literal_calculations":judging.literal_calculations(quote)}
+        self.assertIn("1500*7*3=31500元",judging.proof_assertion(check))
+        check["claim"]="单价1500元"
+        self.assertEqual(judging.proof_assertion(check),"单价1500元")
+        check={"claim":"单价40元","answer_quote":"单价40元，合计40元（计算：40*1=40元）[1][2]。",
+            "literal_calculations":["40*1=40元"]}
+        self.assertEqual(judging.proof_assertion(check),"单价40元")
 
     def test_explicit_schema_capability_rejection_falls_back_once_and_caches_it(self):
         opener = MagicMock()
@@ -425,18 +478,24 @@ class GroundingAlignmentTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("E2E_JUDGE_LIVE_TESTS") == "1", "opt-in live judge checks")
 class LiveGroundingAlignmentTests(unittest.TestCase):
     def test_expanded_calculations_and_qualified_relations_keep_raw_dependencies(self):
-        contract="单价1500元。合同周期3个月。一次性抵扣1200元。"
+        contract="每副本每月单价1500元。合同周期3个月。一次性抵扣1200元。"
         cases=[
             (contract,"计划采购7个。","周期原价31500元（计算：1500*7*3=31500元）","周期原价为10500乘3得到31500元",1,2,True),
             (contract,"计划采购7个。","最终应付30300元（计算：1500*7*3-1200=30300元）","应付金额为31500减1200得到30300元",1,2,True),
+            (contract,"计划采购7个。","周期原价31500元（计算：10500*3=31500元）（计算：1500*7*3=31500元）","周期原价为10500乘3得到31500元",1,2,True),
+            (contract,"计划采购7个。","最终应付30300元（计算：31500-1200=30300元）（计算：1500*7*3-1200=30300元）","应付金额为31500减1200得到30300元",1,2,True),
+            (contract,"计划采购7个。","周期原价36000元（计算：1500*8*3=36000元）","周期原价36000元",1,2,False),
+            ("每副本单价1500元。合同周期3个月。一次性抵扣1200元。","计划采购7个。",
+                "周期原价31500元（计算：1500*7*3=31500元）","周期原价31500元",1,2,False),
             ("订单服务属于交易域。","交易域正式最低副本数至少7个。","订单服务所属交易域的最低副本要求为至少7个","订单服务所属交易域的最低副本要求为至少7个",2,1,True),
             (contract,"计划采购7个。","每副本单价为1500元","每副本单价为1500元",1,2,False),
             ("实测验收日期2028年6月20日。","V2生效日期2028年6月1日。","V2的生效日期为2028年6月1日","V2的生效日期为2028年6月1日",2,1,False),
             ("订单服务属于交易域。","正式最低副本要求为至少7个。","正式最低副本要求为至少7个","正式最低副本要求为至少7个",2,1,False),
         ]
         for first,second,statement,paraphrase,known,checked,expected in cases:
-            sources=[{"id":1,"result":{"content":first}},{"id":2,"result":{"content":second}}]
-            answer=statement+"[1][2]。"
+            sources=[{"id":1,"result":{"content":first}},{"id":3,"result":{"content":second}}]
+            answer=statement+"[1][3]。"
+            known=3 if known==2 else known;checked=3 if checked==2 else checked
             item={"claim":paraphrase,"answer_span_ids":[1],"verdict":"supported",
                 "support":[{"source_id":known,"passage_ids":[1]}],"citations":[{"source_id":known,"supported":True,"passage_ids":[1]}]}
             judge=judging.Judge();real_call=judge._call
@@ -447,8 +506,8 @@ class LiveGroundingAlignmentTests(unittest.TestCase):
                 result=judge._validated_call("grounding",judging.GROUNDING_PROMPT,
                     {"answer":answer,"sources":judging.visible_sources(sources)},Path(directory),
                     lambda p:judging.validate_grounding(p,sources,answer,True))
-            actual=next(c["supported"] for c in result["result"]["claims"][0]["citations"] if c["source_id"]==checked)
-            self.assertEqual(actual,expected,statement)
+                citation=next(c for c in result["result"]["claims"][0]["citations"] if c["source_id"]==checked)
+                self.assertEqual(citation["supported"],expected,(statement,citation))
     def test_accuracy_schema_handles_empty_reference_facts(self):
         judge = judging.Judge()
         answer = "当前资料不足，无法确认。"
