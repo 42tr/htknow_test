@@ -498,6 +498,108 @@ def read_report_html(run: Run) -> bytes:
     return original
 
 
+def _answer_metrics(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the answer metrics when present, with a retrieval fallback."""
+    answers = report.get("answers")
+    if isinstance(answers, dict) and isinstance(answers.get("metrics"), dict):
+        return answers["metrics"]
+    return report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+
+
+def _comparison_metric_rows(left: Dict[str, Any], right: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build a small, stable metric model for the browser comparison view."""
+    definitions = (
+        ("completion_rate", "完成率", "%", True),
+        ("correctness", "答案正确率", "%", True),
+        ("fact_completeness", "事实完整度", "%", True),
+        ("faithfulness", "事实忠实度", "%", True),
+        ("citation_precision", "引用精确率", "%", True),
+        ("citation_coverage", "引用覆盖率", "%", True),
+        ("abstention_rate", "拒答准确率", "%", True),
+        ("rule_pass_rate", "规则通过率", "%", True),
+        ("latency.p95", "答案 P95", "ms", False),
+    )
+    rows: List[Dict[str, Any]] = []
+    for key, label, unit, higher_is_better in definitions:
+        def get_value(metrics: Dict[str, Any]) -> Any:
+            if "." not in key:
+                return metrics.get(key)
+            value: Any = metrics
+            for part in key.split("."):
+                value = value.get(part) if isinstance(value, dict) else None
+            return value
+        lv, rv = get_value(left), get_value(right)
+        if lv is None and rv is None:
+            continue
+        delta = rv - lv if isinstance(lv, (int, float)) and isinstance(rv, (int, float)) else None
+        rows.append({"key": key, "label": label, "unit": unit, "higher_is_better": higher_is_better,
+                     "left": lv, "right": rv, "delta": delta})
+    return rows
+
+
+def build_comparison(left_run: Run, right_run: Run) -> Dict[str, Any]:
+    """Load two completed JSON artifacts and return a compact comparison payload."""
+    if left_run.status == "running" or right_run.status == "running":
+        raise ApiError(409, "两次运行都结束后才能对比")
+    if not left_run.report_json.exists() or not right_run.report_json.exists():
+        raise ApiError(404, "所选运行尚未生成 JSON 报告")
+    try:
+        left_report = json.loads(left_run.report_json.read_text(encoding="utf-8"))
+        right_report = json.loads(right_run.report_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ApiError(422, f"读取报告失败: {exc}") from None
+    left_metrics, right_metrics = _answer_metrics(left_report), _answer_metrics(right_report)
+    left_answers, right_answers = left_report.get("answers") or {}, right_report.get("answers") or {}
+    left_rows = left_answers.get("rows") if isinstance(left_answers, dict) else []
+    right_rows = right_answers.get("rows") if isinstance(right_answers, dict) else []
+    left_rows = left_rows if isinstance(left_rows, list) else []
+    right_rows = right_rows if isinstance(right_rows, list) else []
+
+    def row_key(row: Dict[str, Any]) -> str:
+        return ":".join(str(row.get(k, "")) for k in ("category", "case_id", "turn", "repeat"))
+
+    lmap = {row_key(row): row for row in left_rows if isinstance(row, dict)}
+    rmap = {row_key(row): row for row in right_rows if isinstance(row, dict)}
+    row_diffs: List[Dict[str, Any]] = []
+    for key in sorted(set(lmap) | set(rmap)):
+        lrow, rrow = lmap.get(key), rmap.get(key)
+        lp, rp = (lrow or {}).get("passed"), (rrow or {}).get("passed")
+        if lp == rp and not ((lrow or {}).get("error") or (rrow or {}).get("error")):
+            continue
+        if lrow and rrow and lp != rp:
+            change = "improved" if rp is True else "regressed" if lp is True else "changed"
+        elif rrow:
+            change = "added"
+        else:
+            change = "missing"
+        row_diffs.append({"key": key, "change": change,
+                          "left": {k: lrow.get(k) for k in ("case_id", "category", "turn", "passed", "diagnosis", "error")} if lrow else None,
+                          "right": {k: rrow.get(k) for k in ("case_id", "category", "turn", "passed", "diagnosis", "error")} if rrow else None})
+
+    def category_map(metrics: Dict[str, Any]) -> Dict[str, Any]:
+        cats = metrics.get("categories") if isinstance(metrics.get("categories"), dict) else {}
+        return cats
+
+    categories: List[Dict[str, Any]] = []
+    for category in sorted(set(category_map(left_metrics)) | set(category_map(right_metrics))):
+        lcat, rcat = category_map(left_metrics).get(category) or {}, category_map(right_metrics).get(category) or {}
+        categories.append({"category": category, "left": lcat, "right": rcat})
+
+    def run_info(run: Run, report: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+        config = report.get("config") if isinstance(report.get("config"), dict) else {}
+        return {"id": run.id, "backend": run.params.get("backend", config.get("backend", "htknow")),
+                "target": run.target, "status": run.status, "status_label": STATUS_LABEL.get(run.status, run.status),
+                "started_at": run.started_at, "finished_at": run.finished_at,
+                "overall_pass": report.get("overall_pass"), "mode": config.get("mode", run.params.get("mode")),
+                "seed": (report.get("answers") or {}).get("seed"),
+                "planned_turns": metrics.get("planned_turns"), "completed_turns": metrics.get("completed_turns"),
+                "judged_turns": metrics.get("judged_turns")}
+
+    return {"left": run_info(left_run, left_report, left_metrics), "right": run_info(right_run, right_report, right_metrics),
+            "metrics": _comparison_metric_rows(left_metrics, right_metrics), "categories": categories,
+            "differences": row_diffs, "difference_count": len(row_diffs)}
+
+
 CORPUS_PATH = SCRIPT_DIR / "e2e_corpus.json"
 _CORPUS_CACHE: Dict[str, Any] = {"mtime": None, "payload": None}
 
@@ -616,6 +718,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"runs": [r.summary() for r in MANAGER.list()],
                                       "running": MANAGER.running_count(),
                                       "max_concurrent": MANAGER.max_concurrent})
+                return
+            if method == "GET" and path == "/api/compare":
+                assert MANAGER is not None
+                left_id = (query.get("left") or [""])[0]
+                right_id = (query.get("right") or [""])[0]
+                if not left_id or not right_id or left_id == right_id:
+                    raise ApiError(400, "请选择两次不同的已完成运行")
+                self._send_json(200, build_comparison(MANAGER.get(left_id), MANAGER.get(right_id)))
                 return
             if method == "POST" and path == "/api/runs":
                 assert MANAGER is not None
@@ -1693,6 +1803,21 @@ UI_HTML = r"""<!doctype html>
         max-width: 190px;
         background: #fafbf8;
       }
+      .history-tools {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .history-tools button {
+        font-size: 11px;
+        padding: 7px 11px;
+      }
+      .history-tools button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
       .history-panel .tbl-wrap {
         padding: 0 15px 10px;
       }
@@ -1745,6 +1870,119 @@ UI_HTML = r"""<!doctype html>
         color: #899381;
         font-size: 10px;
         white-space: nowrap;
+      }
+      .compare-check {
+        width: 15px;
+        height: 15px;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+      .compare-panel {
+        margin-top: 18px;
+        overflow: hidden;
+      }
+      .compare-panel[hidden] {
+        display: none;
+      }
+      .compare-heading {
+        padding: 20px 28px 14px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      .compare-heading h2 {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .compare-heading p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .compare-body {
+        padding: 0 15px 22px;
+      }
+      .compare-runs {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin: 0 13px 14px;
+      }
+      .compare-run {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px 14px;
+        background: #fbfcf9;
+      }
+      .compare-run .eyebrow {
+        margin-bottom: 5px;
+        color: var(--muted);
+      }
+      .compare-run strong {
+        display: block;
+        font-size: 13px;
+        margin-bottom: 4px;
+      }
+      .compare-run small {
+        color: var(--muted);
+        font: 10px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        overflow-wrap: anywhere;
+      }
+      .compare-table {
+        min-width: 620px;
+      }
+      .compare-table td,
+      .compare-table th {
+        padding: 10px 12px;
+      }
+      .compare-table .delta-up {
+        color: var(--ok);
+      }
+      .compare-table .delta-down {
+        color: var(--bad);
+      }
+      .compare-table .delta-neutral {
+        color: var(--muted);
+      }
+      .compare-subheading {
+        margin: 20px 13px 8px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .compare-diff {
+        margin: 0 13px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .compare-diff-row {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        font-size: 11px;
+        line-height: 1.7;
+      }
+      .compare-diff-row:last-child {
+        border-bottom: 0;
+      }
+      .compare-diff-row .diff-key {
+        font: 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink);
+      }
+      .compare-diff-row .diff-diagnosis {
+        color: var(--muted);
+        overflow-wrap: anywhere;
+      }
+      @media (max-width: 700px) {
+        .compare-runs {
+          grid-template-columns: 1fr;
+        }
+        .compare-heading {
+          display: block;
+        }
+        .compare-heading p {
+          margin-top: 6px;
+        }
       }
       .empty-panel {
         padding: 55px 40px 40px;
@@ -2718,18 +2956,22 @@ UI_HTML = r"""<!doctype html>
           <section class="panel history-panel" aria-label="历史运行">
             <div class="history-heading">
               <h2>运行记录<span id="hist-count">—</span></h2>
-              <label for="hist-search" class="sr-only">搜索运行记录</label
-              ><input
-                id="hist-search"
-                type="search"
-                placeholder="搜索目标或运行 ID"
-                autocomplete="off"
-              />
+              <div class="history-tools">
+                <button type="button" class="secondary" id="btn-compare" disabled>对比选中运行 <span id="compare-count">0/2</span></button>
+                <label for="hist-search" class="sr-only">搜索运行记录</label
+                ><input
+                  id="hist-search"
+                  type="search"
+                  placeholder="搜索目标或运行 ID"
+                  autocomplete="off"
+                />
+              </div>
             </div>
             <div class="tbl-wrap">
               <table class="history-table" id="hist-table">
                 <thead>
                   <tr>
+                    <th aria-label="选择对比运行"></th>
                     <th>目标 / 开始时间</th>
                     <th>评测模式</th>
                     <th>状态</th>
@@ -2739,11 +2981,18 @@ UI_HTML = r"""<!doctype html>
                 </thead>
                 <tbody id="hist-body">
                   <tr>
-                    <td colspan="5" class="table-empty">正在读取运行记录…</td>
+                    <td colspan="6" class="table-empty">正在读取运行记录…</td>
                   </tr>
                 </tbody>
               </table>
             </div>
+          </section>
+          <section class="panel compare-panel" id="compare-panel" hidden aria-label="运行结果对比">
+            <div class="compare-heading">
+              <h2>运行结果对比</h2>
+              <p id="compare-summary">选择两条已完成记录查看差异</p>
+            </div>
+            <div class="compare-body" id="compare-body"></div>
           </section>
         </div>
       </div>
@@ -2768,7 +3017,8 @@ UI_HTML = r"""<!doctype html>
         gateOnlyFailed = false,
         answerOnlyFailed = false,
         pollBusy = false,
-        selectionVersion = 0;
+        selectionVersion = 0,
+        compareSelection = [];
       var modeNames = {
         retrieval: "仅检索",
         chat: "对话答案",
@@ -3590,7 +3840,11 @@ UI_HTML = r"""<!doctype html>
                 esc(r.id) +
                 '"' +
                 (r.id === currentRun ? ' aria-current="true"' : "") +
-                '><td><button class="history-open" data-run="' +
+                '><td><input class="compare-check" type="checkbox" data-compare-run="' +
+                esc(r.id) + '" aria-label="选择 ' + esc(r.id) + ' 进行对比"' +
+                (compareSelection.indexOf(r.id) >= 0 ? " checked" : "") +
+                ((r.status === "running" || !r.has_json) ? " disabled" : "") +
+                ' /></td><td><button class="history-open" data-run="' +
                 esc(r.id) +
                 '" aria-label="查看 ' +
                 esc(r.target + " " + dateLabel(r.started_at) + " 的评测结果") +
@@ -3613,7 +3867,7 @@ UI_HTML = r"""<!doctype html>
               );
             })
             .join("") ||
-          '<tr><td colspan="5" class="table-empty">' +
+          '<tr><td colspan="6" class="table-empty">' +
             (filter
               ? "没有匹配的运行记录"
               : "暂无运行记录，从左侧开始第一次评测") +
@@ -3624,6 +3878,94 @@ UI_HTML = r"""<!doctype html>
             tr.onclick = function () {
               selectRun(tr.dataset.id);
             };
+          });
+        document.querySelectorAll("#hist-body .compare-check").forEach(function (box) {
+          box.onclick = function (event) {
+            event.stopPropagation();
+            var id = box.dataset.compareRun,
+              index = compareSelection.indexOf(id);
+            if (box.checked && index < 0) {
+              if (compareSelection.length >= 2) {
+                box.checked = false;
+                toast("最多选择两次运行进行对比", true);
+                return;
+              }
+              compareSelection.push(id);
+            } else if (!box.checked && index >= 0) {
+              compareSelection.splice(index, 1);
+            }
+            updateCompareButton();
+          };
+        });
+        updateCompareButton();
+      }
+      function updateCompareButton() {
+        var count = compareSelection.length;
+        $("#compare-count").textContent = count + "/2";
+        $("#btn-compare").disabled = count !== 2;
+      }
+      function compareValue(value, unit) {
+        if (value == null) return "—";
+        if (unit === "ms") return fmtMs(value);
+        return fmtNum(value) + "%";
+      }
+      function compareDelta(metric) {
+        if (metric.delta == null) return '<span class="delta-neutral">—</span>';
+        var d = Number(metric.delta),
+          cls = Math.abs(d) < 0.005 ? "delta-neutral" :
+            ((metric.higher_is_better ? d > 0 : d < 0) ? "delta-up" : "delta-down"),
+          sign = d > 0 ? "+" : "";
+        return '<span class="' + cls + '">' + esc(sign + (metric.unit === "ms" ? Math.round(d) + " ms" : d.toFixed(1) + "%")) + "</span>";
+      }
+      function compareRunCard(run) {
+        var backend = run.backend === "weknora" ? "WeKnora" : "HTKnow";
+        return '<div class="compare-run"><div class="eyebrow">' + esc(backend) + ' · ' +
+          esc(run.status_label || "") + '</div><strong>' + esc(run.target || "—") +
+          '</strong><small>' + esc(run.id) + (run.seed ? " · seed " + esc(run.seed) : "") +
+          '</small><div class="history-time">完成 ' + esc(dateLabel(run.finished_at)) + '</div></div>';
+      }
+      function renderComparison(data) {
+        var left = data.left || {}, right = data.right || {},
+          metrics = data.metrics || [], categories = data.categories || [],
+          diffs = data.differences || [];
+        $("#compare-panel").hidden = false;
+        $("#compare-summary").textContent = "逐项比较指标、分类通过率与 " + (data.difference_count || 0) + " 个逐题差异";
+        var metricRows = metrics.map(function (m) {
+          return '<tr><td>' + esc(m.label) + '</td><td class="num">' + compareValue(m.left, m.unit) +
+            '</td><td class="num">' + compareValue(m.right, m.unit) + '</td><td class="num">' + compareDelta(m) + '</td></tr>';
+        }).join("");
+        var categoryRows = categories.map(function (c) {
+          var l = c.left || {}, r = c.right || {}, lp = l.pass_rate, rp = r.pass_rate,
+            delta = lp != null && rp != null ? rp - lp : null,
+            cls = delta == null || Math.abs(delta) < 0.005 ? "delta-neutral" : delta > 0 ? "delta-up" : "delta-down";
+          return '<tr><td>' + esc(c.category) + '</td><td class="num">' + esc(l.passed == null ? "—" : l.passed + "/" + (l.planned == null ? "—" : l.planned)) +
+            '</td><td class="num">' + esc(r.passed == null ? "—" : r.passed + "/" + (r.planned == null ? "—" : r.planned)) +
+            '</td><td class="num"><span class="' + cls + '">' + (delta == null ? "—" : (delta > 0 ? "+" : "") + fmtNum(delta) + "%") + '</span></td></tr>';
+        }).join("");
+        var diffRows = diffs.map(function (d) {
+          var l = d.left || {}, r = d.right || {},
+            ltext = l.error || l.diagnosis || (l.passed === true ? "通过" : l.passed === false ? "未通过" : "缺失"),
+            rtext = r.error || r.diagnosis || (r.passed === true ? "通过" : r.passed === false ? "未通过" : "缺失");
+          return '<div class="compare-diff-row"><div class="diff-key">' + esc(d.key) + ' · ' + esc(d.change) +
+            '</div><div class="diff-diagnosis">左：' + esc(ltext) + '<br>右：' + esc(rtext) + '</div></div>';
+        }).join("");
+        $("#compare-body").innerHTML = '<div class="compare-runs">' + compareRunCard(left) + compareRunCard(right) +
+          '</div><div class="tbl-wrap"><table class="compare-table"><thead><tr><th>指标</th><th class="num">左侧运行</th><th class="num">右侧运行</th><th class="num">右 − 左</th></tr></thead><tbody>' +
+          (metricRows || '<tr><td colspan="4" class="table-empty">报告没有可比较的指标</td></tr>') + '</tbody></table></div>' +
+          (categoryRows ? '<h3 class="compare-subheading">分类通过情况</h3><div class="tbl-wrap"><table class="compare-table"><thead><tr><th>分类</th><th class="num">左侧通过</th><th class="num">右侧通过</th><th class="num">通过率差</th></tr></thead><tbody>' + categoryRows + '</tbody></table></div>' : "") +
+          '<h3 class="compare-subheading">逐题差异 <span class="muted">' + diffs.length + ' 项</span></h3>' +
+          '<div class="compare-diff">' + (diffRows || '<div class="table-empty">两次运行的逐题结果一致</div>') + '</div>';
+        $("#compare-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      function compareSelected() {
+        if (compareSelection.length !== 2) return;
+        $("#compare-summary").textContent = "正在读取两份报告…";
+        $("#compare-panel").hidden = false;
+        api("/api/compare?left=" + encodeURIComponent(compareSelection[0]) + "&right=" + encodeURIComponent(compareSelection[1]))
+          .then(renderComparison)
+          .catch(function (e) {
+            $("#compare-summary").textContent = "对比失败";
+            toast("读取对比结果失败：" + e.message, true);
           });
       }
       function refreshList() {
@@ -3679,6 +4021,7 @@ UI_HTML = r"""<!doctype html>
         $("#btn-cancel").onclick = cancelRun;
         $("#btn-new").onclick = focusConfig;
         $("#btn-empty-start").onclick = focusConfig;
+        $("#btn-compare").onclick = compareSelected;
         $("#btn-config").onclick = function () {
           setConfigExpanded($("#form-content").hidden);
         };

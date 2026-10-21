@@ -652,6 +652,58 @@ class IntegrationTests(unittest.TestCase):
 
 
 class WebIntegrationTests(unittest.TestCase):
+    def test_web_compare_api_returns_metrics_categories_and_differences(self):
+        with tempfile.TemporaryDirectory() as root:
+            runs_dir = Path(root)
+            manager = web.RunManager(runs_dir, 2)
+            previous = web.MANAGER
+            web.MANAGER = manager
+            report_base = {
+                "config": {"backend": "htknow", "mode": "chat"},
+                "overall_pass": False,
+                "answers": {"seed": "same", "metrics": {
+                    "completion_rate": 100, "correctness": 80, "citation_coverage": 90,
+                    "categories": {"facts": {"planned": 2, "passed": 1, "pass_rate": 50}},
+                }, "rows": [{"category": "facts", "case_id": "fact-01", "turn": 1,
+                            "repeat": 1, "passed": False, "diagnosis": "缺少引用"}]},
+            }
+            try:
+                left_dir, right_dir = runs_dir / "left", runs_dir / "right"
+                left_dir.mkdir(); right_dir.mkdir()
+                (left_dir / "report.json").write_text(json.dumps(report_base), encoding="utf-8")
+                right = json.loads(json.dumps(report_base))
+                right["config"]["backend"] = "weknora"
+                right["overall_pass"] = True
+                right["answers"]["metrics"]["correctness"] = 100
+                right["answers"]["metrics"]["categories"]["facts"] = {"planned": 2, "passed": 2, "pass_rate": 100}
+                right["answers"]["rows"][0]["passed"] = True
+                right["answers"]["rows"][0]["diagnosis"] = "通过"
+                (right_dir / "report.json").write_text(json.dumps(right), encoding="utf-8")
+                left = web.Run("left", "127.0.0.1:13000", {"backend": "htknow"}, [], left_dir,
+                               status="fail", finished_at=web.now_iso())
+                right_run = web.Run("right", "http://weknora", {"backend": "weknora"}, [], right_dir,
+                                    status="pass", finished_at=web.now_iso())
+                manager.runs.update({"left": left, "right": right_run})
+                server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+                server.daemon_threads = True
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    url = (f"http://127.0.0.1:{server.server_port}/api/compare"
+                           "?left=left&right=right")
+                    with urllib.request.urlopen(url, timeout=3) as response:
+                        payload = json.load(response)
+                    self.assertEqual(payload["left"]["backend"], "htknow")
+                    self.assertEqual(payload["right"]["backend"], "weknora")
+                    self.assertEqual(payload["difference_count"], 1)
+                    self.assertEqual(payload["categories"][0]["right"]["passed"], 2)
+                    self.assertEqual(payload["metrics"][1]["delta"], 20)
+                finally:
+                    server.shutdown(); server.server_close(); thread.join()
+            finally:
+                manager.shutdown()
+                web.MANAGER = previous
+
     def test_options_reach_the_cli_and_nonfinite_values_are_rejected(self):
         params = web.sanitize_params({"mode":"both","judge_mode":"rules","answer_categories":"facts,multi_turn",
                                       "answer_limit":2,"answer_seed":"stable"})
