@@ -318,6 +318,11 @@ class WeKnoraBackend:
 
 def normalize_answer(answer: str, references: List[Dict[str, Any]], wiki_pages=None):
     """Translate only native citation markers. Never create an absent citation."""
+    # WeKnora may multiplex model reasoning in the answer stream as a
+    # <think>...</think> block. It is retained in raw_answer for diagnostics,
+    # but must not enter semantic/citation evaluation as user-facing content.
+    answer = re.sub(r"(?is)<think\b[^>]*>.*?</think\s*>", "", answer)
+    answer = re.sub(r"(?is)<thinking\b[^>]*>.*?</thinking\s*>", "", answer)
     by_id = {item["id"]: index for index, item in enumerate(references, 1)}
     changes = []
 

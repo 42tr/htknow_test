@@ -378,6 +378,11 @@ class WeKnoraTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             weknora.normalize_answer('<kb chunk_id="unknown"/>', [item])
 
+    def test_internal_thinking_is_removed_from_evaluated_answer_but_raw_answer_stays_available(self):
+        item = reference()
+        normalized, _ = weknora.normalize_answer('<think>未引用的内部推理事实</think>负责人林岚<kb chunk_id="chunk-uuid"/>', [item])
+        self.assertEqual(normalized, "负责人林岚[1]")
+
     def test_wiki_links_require_actual_returned_page_body(self):
         item = reference()
         item.update(chunk_type="wiki_page", metadata={"wiki_slug": "concept/test"})
