@@ -91,6 +91,8 @@ def sse_events(response: Any, deadline: float, raw_file: Any) -> Iterator[Any]:
 
 
 def stream_chat(client: Any, request: Dict[str, Any], timeout: float, directory: Path) -> Dict[str, Any]:
+    if getattr(client, "backend", None):
+        return client.backend.stream_chat(request, timeout, directory)
     directory.mkdir(parents=True, exist_ok=True)
     write_json(directory / "request.json", request)
     result: Dict[str, Any] = {"answer": "", "sources": [], "events": [], "complete": False,
@@ -348,6 +350,10 @@ def setup_scopes(suite: Dict[str, Any], args: Any, client: Any, harness: Any,
                                 "user", "e2e-private-reader", args.http_timeout, args.retries, args.insecure, False)
         scopes["denied"] = {"client": reader, "kb_id": None, "error": None}
         try:
+            if getattr(client, "backend", None):
+                owner = client
+                reader = harness.make_client(args, client.base_url, reader=True)
+                scopes["denied"]["client"] = reader
             private_id, _ = harness.create_knowledge_base(owner, "E2E私有隔离-" + suite["seed"], "答案评估私有对照", 90, False)
             cleanup.append((owner, private_id))
             scopes["denied"]["kb_id"] = private_id
@@ -370,7 +376,7 @@ def setup_scopes(suite: Dict[str, Any], args: Any, client: Any, harness: Any,
     if any(c.get("scope") == "wiki" for c in suite["cases"]):
         scopes["wiki"] = {"client": client, "kb_id": None, "error": None}
         try:
-            wiki_id, _ = harness.create_knowledge_base(client, "E2E-Wiki-" + suite["seed"], "手工 Wiki 证据使用评测", 90, False)
+            wiki_id, _ = harness.create_knowledge_base(client, "E2E-Wiki-" + suite["seed"], "手工 Wiki 证据使用评测", 90, False, wiki=True)
             cleanup.append((client, wiki_id))
             scopes["wiki"]["kb_id"] = wiki_id
             wiki_pairs = [p for p in suite["pairs"] if p["scope"] == "wiki"]
@@ -382,7 +388,7 @@ def setup_scopes(suite: Dict[str, Any], args: Any, client: Any, harness: Any,
             if not suite["wiki_pages"]:
                 raise AnswerError("Wiki 用例没有 Wiki 页面 fixture")
             for page in suite["wiki_pages"]:
-                client.post_json("/api/v1/knowledge/wiki/page", dict(page, kb_id=wiki_id, status="published", page_type="concept"))
+                harness.create_wiki_page(client, wiki_id, page)
             deadline = time.monotonic() + min(args.parse_timeout, 30)
             while True:
                 found, _ = harness.run_search(client, suite["private_values"]["wiki_project"], wiki_id)
@@ -519,6 +525,9 @@ def run_suite(suite: Dict[str, Any], args: Any, client: Any, harness: Any, workd
     # Keep the clients out of JSON. The orchestrator disposes all KBs only after
     # retrieval AND generation gates have been evaluated.
     result["_cleanup"] = cleanup
+    result["_session_clients"] = list({id(scope["client"]): scope["client"]
+                                       for scope in suite["fixture_scopes"].values()
+                                       if getattr(scope["client"], "backend", None)}.values())
     return result
 
 

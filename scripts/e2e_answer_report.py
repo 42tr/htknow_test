@@ -454,6 +454,7 @@ def render_gates(gates: List[Dict[str, Any]]) -> str:
 
 def render_report(report: Dict[str, Any]) -> str:
     cfg, answers = report.get("config") or {}, report["answers"]
+    backend_label = "WeKnora" if cfg.get("backend") == "weknora" else "HTKnow"
     gates = report.get("gates") or []
     failed = [gate for gate in gates if gate.get("critical") and gate.get("threshold") is not None and not gate.get("passed")]
     state = "通过验收" if report.get("overall_pass") else "未通过验收"
@@ -461,8 +462,8 @@ def render_report(report: Dict[str, Any]) -> str:
     html{scroll-behavior:smooth;scroll-padding-top:20px}body{margin:0;background:#f6f7f4;color:#263129;-webkit-font-smoothing:antialiased;font:14px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}.report-shell{max-width:1512px;margin:auto;padding:0 36px 35px}.report-brand{display:flex;align-items:center;justify-content:space-between;padding:22px 0;border-bottom:1px solid #e0e6db}.report-brand strong{font-size:20px;letter-spacing:-.7px}.report-brand span{font-size:11px;color:#839076;margin-left:14px;letter-spacing:.6px}.report-brand a{font-size:11px;color:#617b50;text-decoration:none}.report-brand button{font:inherit;font-size:11px;padding:5px 10px;background:transparent;border:1px solid #dce4d4;border-radius:5px;color:#617b50;cursor:pointer}.report-brand nav{display:flex;align-items:center;gap:22px}.report-title{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:31px 0 26px}.report-title h1{font-size:27px;font-weight:600;letter-spacing:-.5px;margin:0 0 8px}.report-title p{font-size:12px;color:#748369;margin:0;overflow-wrap:anywhere}.report-title .report-run{font-size:10px;font-family:ui-monospace,monospace;margin-top:7px;color:#929e86}.report-verdict{text-align:right;flex:none}.report-verdict strong{font-size:13px;display:inline-block;border-radius:6px;padding:6px 11px;background:#fbefeb;color:#ad493f;font-weight:500}.report-verdict.pass strong{background:#eaf3e7;color:#28654b}.report-verdict p{font-size:10px;margin-top:7px}.report-footer{font-size:10px;text-align:center;color:#929e86;padding:25px 0 0}.report-footer-section{margin-top:22px}.report-support{margin-top:24px}@media(max-width:900px){.report-shell{padding:0 20px 25px}.report-title h1{font-size:24px}}@media(max-width:480px){.report-shell{padding:0 13px 25px}.report-brand{padding:16px 4px}.report-brand strong{font-size:18px}.report-brand span{font-size:9px;margin-left:9px}.report-brand nav{gap:12px}.report-brand a{font-size:10px}.report-brand button{display:none}.report-title{padding:25px 4px 21px;align-items:flex-start}.report-title h1{font-size:22px}.report-title p{font-size:10px}.report-title .report-run{font-size:9px;max-width:230px}.report-verdict strong{font-size:10px;padding:5px 7px}.report-verdict p{font-size:9px}.report-footer{font-size:9px}}@media print{body{background:#fff}.report-shell{padding:0}.report-brand nav{display:none}.report-title{padding:20px 0}.report-verdict strong{border:1px solid #bbb}.report-brand{padding-top:0}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto!important}}
     """
     out = ['<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
-           f'<title>HTKnow 生成答案测试报告 · {esc(cfg.get("run_id"))}</title><style>{shell_css}</style></head><body><main class="report-shell">',
-           '<header class="report-brand"><div><strong>HTKnow</strong><span>EVALUATION REPORT</span></div><nav aria-label="报告导航">'
+           f'<title>{backend_label} 生成答案测试报告 · {esc(cfg.get("run_id"))}</title><style>{shell_css}</style></head><body><main class="report-shell">',
+           f'<header class="report-brand"><div><strong>{backend_label}</strong><span>EVALUATION REPORT</span></div><nav aria-label="报告导航">'
            '<a href="#case-review">逐题复盘</a><a href="#report-gates">验收门禁</a><button type="button" onclick="window.print()">打印报告</button></nav></header>',
            '<div class="report-title"><div><h1>' + ('对话答案复评报告' if cfg.get('evaluation_type') == 'rejudge' else '对话答案评测报告') + '</h1>',
            f'<p>{esc(cfg.get("target"))} · {esc(str(cfg.get("started_at", "")).replace("T", " ")[:16])} · 总用时 {elapsed(cfg.get("total_ms"))}</p>',
@@ -491,5 +492,5 @@ def render_report(report: Dict[str, Any]) -> str:
     out.append('</tbody></table></div>')
     if report.get("warnings"):
         out.append('<ul class="ar-run-warnings">' + ''.join(f'<li>{esc(w)}</li>' for w in report["warnings"]) + '</ul>')
-    out.append('</details></div><footer class="report-footer">HTKnow Evaluation · 回答、证据与评审依据均保留在本报告中</footer></main></body></html>')
+    out.append(f'</details></div><footer class="report-footer">{backend_label} Evaluation · 回答、证据与评审依据均保留在本报告中</footer></main></body></html>')
     return "".join(out)

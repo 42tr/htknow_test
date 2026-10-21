@@ -74,10 +74,13 @@ NUMERIC_OPTIONS: Dict[str, Tuple[type, float, float]] = {
 }
 TEXT_OPTIONS = {"user_id", "role", "user_name", "docs", "exclude", "slice_type",
                 "cleanup", "upload_mode", "corpus_cache", "mode", "judge_mode",
-                "judge_url", "judge_model", "answer_categories", "answer_seed"}
+                "judge_url", "judge_model", "answer_categories", "answer_seed", "backend",
+                "weknora_template_kb", "weknora_embedding_model_id", "weknora_chat_model_id",
+                "weknora_rerank_model_id", "weknora_tenant_id"}
 BOOL_OPTIONS = {"offline", "strict_integrity", "public", "refresh_corpus",
                 "allow_negative_failure", "unique_marker"}
 CHOICES = {
+    "backend": {"htknow", "weknora"},
     "slice_type": {"smart", "fixed", "paragraph"},
     "cleanup": {"keep", "delete", "delete-on-pass"},
     "upload_mode": {"sequential", "batch"},
@@ -85,6 +88,7 @@ CHOICES = {
     "judge_mode": {"llm", "rules"},
 }
 DEFAULT_PARAMS: Dict[str, Any] = {
+    "backend": "htknow",
     "user_id": "1", "role": "admin", "user_name": "htknow-e2e-web",
     "slice_type": "smart", "cleanup": "delete-on-pass", "upload_mode": "sequential",
     "repeats": 3, "top_k": 10, "parse_timeout": 1800, "poll_interval": 2,
@@ -145,7 +149,7 @@ class Run:
 
     def summary(self) -> Dict[str, Any]:
         return {
-            "id": self.id, "target": self.target, "status": self.status,
+            "id": self.id, "target": self.target, "backend": self.params.get("backend", "htknow"), "status": self.status,
             "status_label": STATUS_LABEL.get(self.status, self.status),
             "returncode": self.returncode, "started_at": self.started_at,
             "finished_at": self.finished_at, "elapsed_s": round(self.elapsed_s(), 1),
@@ -211,7 +215,8 @@ class RunManager:
                 raise ValueError("来源测试必须结束并生成 JSON 报告后才能重新评审")
             if not json.loads(rejudge_source.report_json.read_text()).get("answers", {}).get("rows"):
                 raise ValueError("来源报告没有对话答案，无法重新评审")
-            params = dict(params, mode=rejudge_source.params.get("mode", "chat"))
+            params = dict(params, mode=rejudge_source.params.get("mode", "chat"),
+                          backend=rejudge_source.params.get("backend", "htknow"))
         target = str(params.get("target") or "").strip()
         if not target:
             raise ValueError("必须填写目标地址 HOST:PORT")
@@ -409,7 +414,8 @@ def build_argv(target: str, params: Dict[str, Any], run_dir: Path) -> List[str]:
                        "--report", str(run_dir / "report.html"),
                        "--json-report", str(run_dir / "report.json")]
     for key in ("user_id", "role", "user_name", "docs", "exclude", "corpus_cache", "judge_url", "judge_model",
-                "answer_categories", "answer_seed"):
+                "answer_categories", "answer_seed", "backend", "weknora_template_kb",
+                "weknora_embedding_model_id", "weknora_chat_model_id", "weknora_rerank_model_id", "weknora_tenant_id"):
         value = params.get(key)
         if value:
             argv += [f"--{key.replace('_', '-')}", str(value)]
@@ -2276,6 +2282,15 @@ UI_HTML = r"""<!doctype html>
                 </p>
               </div>
               <div class="field">
+                <label for="f-backend">被测系统</label>
+                <select id="f-backend"><option value="htknow">HTKnow</option><option value="weknora">WeKnora</option></select>
+              </div>
+              <div id="weknora-options" hidden>
+                <div class="field"><label for="f-weknora_template_kb">WeKnora 配置模板知识库 ID</label>
+                <input id="f-weknora_template_kb" type="text" placeholder="复用已有知识库的模型、分块和存储配置" autocomplete="off" /></div>
+                <p class="field-help">测试会新建独立知识库。也可在服务端配置 WEKNORA_TEMPLATE_KB 或 WEKNORA_EMBEDDING_MODEL_ID。凭据使用 WEKNORA_API_KEY 或 WEKNORA_TOKEN，并将 WEKNORA_BASE_URL 设为目标地址。</p>
+              </div>
+              <div class="field">
                 <label for="f-target"
                   >目标服务地址<span class="req">*</span></label
                 ><input
@@ -2399,7 +2414,7 @@ UI_HTML = r"""<!doctype html>
               <details class="adv">
                 <summary>运行设置</summary>
                 <div class="row">
-                  <div>
+                  <div data-backend="htknow">
                     <label for="f-slice_type">切片方式</label
                     ><select id="f-slice_type">
                       <option value="smart">智能切片</option>
@@ -2462,7 +2477,7 @@ UI_HTML = r"""<!doctype html>
                     placeholder="calibre_docx_demo"
                   />
                 </div>
-                <div class="row">
+                <div class="row" data-backend="htknow">
                   <div>
                     <label for="f-user_id">用户 ID</label
                     ><input type="text" id="f-user_id" value="1" />
@@ -2472,7 +2487,7 @@ UI_HTML = r"""<!doctype html>
                     ><input type="text" id="f-role" value="admin" />
                   </div>
                 </div>
-                <label class="check"
+                <label class="check" data-backend="htknow"
                   ><input type="checkbox" id="f-public" /><span
                     >创建公开知识库</span
                   ></label
@@ -2850,8 +2865,18 @@ UI_HTML = r"""<!doctype html>
           both: "同时验证检索与对话，覆盖完整问答链路。",
         }[mode];
       }
+      function updateBackend() {
+        var backend = $("#f-backend").value;
+        $("#weknora-options").hidden = backend !== "weknora";
+        document.querySelectorAll("[data-backend]").forEach(function (el) {
+          el.hidden = el.dataset.backend !== backend;
+        });
+      }
       function collectParams() {
         var p = { target: $("#f-target").value.trim() };
+        p.backend = $("#f-backend").value;
+        if (p.backend === "weknora" && $("#f-weknora_template_kb").value.trim())
+          p.weknora_template_kb = $("#f-weknora_template_kb").value.trim();
         [
           "slice_type",
           "upload_mode",
@@ -2894,6 +2919,7 @@ UI_HTML = r"""<!doctype html>
         ].forEach(function (k) {
           p[k] = $("#f-" + k).checked;
         });
+        if (p.backend === "weknora") p.public = false;
         return p;
       }
       function validateInputs() {
@@ -3536,7 +3562,7 @@ UI_HTML = r"""<!doctype html>
           filtered = runs.filter(function (r) {
             return (
               !filter ||
-              [r.id, r.target, modeNames[(r.params || {}).mode || "retrieval"]]
+              [r.id, r.target, r.backend || (r.params || {}).backend || "htknow", modeNames[(r.params || {}).mode || "retrieval"]]
                 .join(" ")
                 .toLowerCase()
                 .indexOf(filter) >= 0
@@ -3569,7 +3595,7 @@ UI_HTML = r"""<!doctype html>
                 '" aria-label="查看 ' +
                 esc(r.target + " " + dateLabel(r.started_at) + " 的评测结果") +
                 '">' +
-                esc(r.target) +
+                esc(((r.backend || (r.params || {}).backend) === "weknora" ? "WeKnora" : "HTKnow") + " · " + r.target) +
                 '</button><div class="history-time mono">' +
                 esc(dateLabel(r.started_at)) +
                 '</div></td><td class="mode-label">' +
@@ -3708,9 +3734,11 @@ UI_HTML = r"""<!doctype html>
           if (e.key === "Enter") startRun();
         });
         $("#f-mode").onchange = updateMode;
+        $("#f-backend").onchange = updateBackend;
         $("#f-docs").addEventListener("input", syncDocChips);
         $("#hist-search").addEventListener("input", renderHistory);
         updateMode();
+        updateBackend();
         refreshList();
         listTimer = setInterval(refreshList, 5000);
       }

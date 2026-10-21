@@ -13,6 +13,9 @@
 
 本仓只含测试工具，不含被测服务代码。
 
+支持通过 `--backend weknora` 测试 WeKnora，默认仍为 HTKnow；Web 控制台也可选择被测系统。
+WeKnora 的服务端凭据、模型/模板知识库配置、会话与引用适配说明见 [WeKnora 测试](docs/weknora-testing.md)。
+
 ## 仓库结构
 
 ```
@@ -23,6 +26,7 @@ scripts/e2e_answer_eval.py        对话评估入口、完整 SSE 采集与逐�
 scripts/e2e_answer_report.py      可筛选的逐题复盘、参考事实对照与引用证据定位
 scripts/e2e_answer_cases.json     80 个答案评估用例及运行时合成事实模板
 scripts/e2e_judge.py              独立模型评审、评分结构与证据引句校验
+scripts/e2e_weknora.py            WeKnora 建库、检索、会话与 SSE 适配
 tests/test_answer_eval.py         离线协议与端到端回归测试
 docs/e2e-retrieval-test.md        指标口径、门禁阈值、语料说明与排查建议
 deploy/e2e-web/                   Web 控制台的容器化部署（Dockerfile / compose / build.sh）

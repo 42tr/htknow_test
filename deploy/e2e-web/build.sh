@@ -9,6 +9,7 @@ CTX="$(mktemp -d "${TMPDIR:-/tmp}/htknow-e2e-web-ctx.XXXXXX")"
 trap 'rm -rf "$CTX"' EXIT
 
 cp "$REPO/scripts/e2e_web.py" "$REPO/scripts/e2e_retrieval_test.py" \
+   "$REPO/scripts/e2e_weknora.py" \
    "$REPO/scripts/e2e_corpus.json" "$REPO/scripts/e2e_answer_eval.py" \
    "$REPO/scripts/e2e_judge.py" "$REPO/scripts/e2e_answer_report.py" \
    "$REPO/scripts/e2e_answer_cases.json" "$CTX/"

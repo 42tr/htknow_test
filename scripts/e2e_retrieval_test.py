@@ -29,6 +29,7 @@ import hashlib
 import html as html_mod
 import json
 import math
+import os
 import random
 import re
 import string
@@ -191,13 +192,26 @@ class Client:
 
     def _open(self, request: urllib.request.Request) -> Tuple[int, bytes, float]:
         started = time.perf_counter()
-        response = urllib.request.urlopen(request, timeout=self.timeout, context=self._ctx)
+        response = self.open(request, self.timeout)
         try:
             status = getattr(response, "status", None) or response.getcode()
             payload = response.read()
         finally:
             response.close()
         return int(status), payload, (time.perf_counter() - started) * 1000.0
+
+    def open(self, request: urllib.request.Request, timeout: float):
+        opener = getattr(self, "_opener", None)
+        return (opener.open(request, timeout=timeout) if opener else
+                urllib.request.urlopen(request, timeout=timeout, context=self._ctx))
+
+    def redact(self, value: str) -> str:
+        for name, secret in self.headers.items():
+            if name.lower() in ("x-api-key", "authorization") and secret:
+                value = value.replace(secret, "[REDACTED]")
+                if secret.startswith("Bearer "):
+                    value = value.replace(secret[7:], "[REDACTED]")
+        return value
 
     def request(self, method: str, path: str, *, query: Optional[Dict[str, Any]] = None,
                 json_body: Any = None, body: Optional[bytes] = None,
@@ -231,7 +245,7 @@ class Client:
                 try:
                     raw = exc.read()
                     decoded = self._decode(raw)
-                    detail = str(decoded)[:400]
+                    detail = self.redact(str(decoded))[:400]
                 except Exception:
                     detail = str(exc.reason)
                 self.total_ms += elapsed
@@ -603,8 +617,9 @@ class DocResult:
     sha256: Optional[str] = None
     size_bytes: int = 0
     local_path: Optional[str] = None
-    kb_file_id: Optional[int] = None
+    kb_file_id: Any = None
     status: Optional[int] = None
+    backend_status: Optional[str] = None
     processing_status: Optional[int] = None
     wiki_status: Optional[str] = None
     server_log: str = ""
@@ -624,8 +639,8 @@ class DocResult:
 @dataclass
 class Hit:
     rank: int
-    slice_id: int
-    file_id: Optional[int]
+    slice_id: Any
+    file_id: Any
     filename: str
     score: float
     content: str          # 完整切片正文，仅用于关键词判定，写入报告前会被替换为 preview
@@ -699,7 +714,36 @@ class GateResult:
 # --------------------------------------------------------------------------- #
 # 被测服务调用
 # --------------------------------------------------------------------------- #
+def make_client(args: argparse.Namespace, base_url: str, *, reader: bool = False) -> Client:
+    client = Client(base_url, args.user_id, args.role, args.user_name,
+                    args.http_timeout, args.retries, args.insecure, verbose=not args.quiet)
+    if getattr(args, "backend", "htknow") == "weknora":
+        from e2e_weknora import WeKnoraBackend
+        client.backend = WeKnoraBackend(client, args, sys.modules[__name__], reader=reader)
+    return client
+
+
+def file_record(client: Client, file_id: Any):
+    if getattr(client, "backend", None):
+        return client.backend.file_record(file_id)
+    return client.get(f"{API_ROOT}/files/{file_id}")
+
+
+def delete_knowledge_base(client: Client, kb_id: Any):
+    if getattr(client, "backend", None):
+        return client.backend.delete_kb(kb_id)
+    return client.delete(f"{API_ROOT}/knowledge_base/{kb_id}")
+
+
+def create_wiki_page(client: Client, kb_id: Any, page: Dict[str, Any]):
+    if getattr(client, "backend", None):
+        return client.backend.create_wiki_page(kb_id, page)
+    return client.post_json(f"{API_ROOT}/wiki/page", dict(page, kb_id=kb_id, status="published", page_type="concept"))
+
+
 def preflight(client: Client) -> Dict[str, Any]:
+    if getattr(client, "backend", None):
+        return client.backend.preflight()
     env: Dict[str, Any] = {"base_url": client.base_url, "reachable": False,
                            "auth_ok": False, "openapi_title": None, "openapi_version": None,
                            "kb_list_ms": None, "existing_kbs": None}
@@ -727,7 +771,11 @@ def preflight(client: Client) -> Dict[str, Any]:
 
 
 def create_knowledge_base(client: Client, name: str, description: str,
-                          parse_priority: int, is_public: bool) -> Tuple[int, float]:
+                          parse_priority: int, is_public: bool, *, wiki: bool = False) -> Tuple[Any, float]:
+    if getattr(client, "backend", None):
+        if is_public:
+            raise HarnessError("WeKnora 测试库使用真实空间权限，不支持 HTKnow 的 --public 参数")
+        return client.backend.create_kb(name, description, wiki=wiki)
     payload, elapsed = client.post_json(f"{API_ROOT}/knowledge_base/", {
         "name": name, "description": description,
         "kb_type": "analysis", "is_public": is_public, "parse_priority": parse_priority,
@@ -739,6 +787,8 @@ def create_knowledge_base(client: Client, name: str, description: str,
 
 def upload_document(client: Client, kb_id: int, path: Path, slice_type: str,
                     tags: Sequence[str]) -> Tuple[int, float]:
+    if getattr(client, "backend", None):
+        return client.backend.upload(kb_id, path)
     ctype = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
              "doc": "application/msword", "xlsx": "application/vnd.openxmlformats-ms-excel",
              "md": "text/markdown"}.get(path.suffix.lstrip(".").lower(), "text/plain")
@@ -761,7 +811,7 @@ def wait_for_parse(client: Client, file_id: int, timeout: float, interval: float
     record: Dict[str, Any] = {}
     last_status: Any = None
     while True:
-        payload, _ = client.get(f"{API_ROOT}/files/{file_id}")
+        payload, _ = file_record(client, file_id)
         polls += 1
         if isinstance(payload, dict):
             record = payload
@@ -778,6 +828,8 @@ def wait_for_parse(client: Client, file_id: int, timeout: float, interval: float
 
 
 def fetch_slices(client: Client, file_id: int) -> Tuple[int, int]:
+    if getattr(client, "backend", None):
+        return client.backend.fetch_slices(file_id)
     payload, _ = client.get(f"{API_ROOT}/files/{file_id}/slices")
     if not isinstance(payload, list):
         return 0, 0
@@ -787,6 +839,8 @@ def fetch_slices(client: Client, file_id: int) -> Tuple[int, int]:
 
 def run_search(client: Client, query: str, kb_id: int,
                file_ids: Optional[Sequence[int]] = None) -> Tuple[List[Dict[str, Any]], float]:
+    if getattr(client, "backend", None):
+        return client.backend.search(query, kb_id, file_ids)
     params: Dict[str, Any] = {"query": query, "kb_id": kb_id}
     if file_ids:
         params["file_id"] = ",".join(str(i) for i in file_ids)
@@ -812,8 +866,8 @@ def normalize_hits(raw_results: Sequence[Dict[str, Any]], limit: int,
             page = wiki.get("page") or {}
             content = content or str(page.get("content") or page.get("summary") or "")
         hits.append(Hit(
-            rank=rank, slice_id=int(item.get("id") or 0),
-            file_id=int(file_id) if file_id else None,
+            rank=rank, slice_id=item.get("id") or 0,
+            file_id=file_id or None,
             filename=str((file_info or {}).get("filename") or
                          ((wiki or {}).get("page") or {}).get("title") or
                          ("wiki" if wiki else "-")),
@@ -1162,11 +1216,12 @@ def render_html(report: Dict[str, Any]) -> str:
     docs: List[Dict[str, Any]] = report["documents"]
     overall = report["overall_pass"]
     eval_k = metrics["eval_k"]
+    backend_label = "WeKnora" if cfg.get("backend") == "weknora" else "HTKnow"
 
     out: List[str] = [
         "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">",
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-        f"<title>HTKnow 端到端检索测试报告 · {esc(cfg['run_id'])}</title>",
+        f"<title>{backend_label} 端到端检索测试报告 · {esc(cfg['run_id'])}</title>",
         f"<style>{CSS}</style></head><body><div class=\"wrap\">",
     ]
 
@@ -1179,7 +1234,7 @@ def render_html(report: Dict[str, Any]) -> str:
     out.append(f"""
 <header class="top"><div class="verdict {verdict_cls}"><div class="big">{verdict_txt}</div>
 <div class="small">{len(failed_gates)} 项关键门禁未达标</div></div>
-<h1>HTKnow 端到端检索测试报告</h1>
+<h1>{backend_label} 端到端检索测试报告</h1>
 <div class="sub">建库 → 上传 → 解析 → 检索 → 指标评估 全链路自动化验收</div>
 <div class="meta">
 <span class="chip">目标 {esc(cfg['target'])}</span>
@@ -1259,8 +1314,10 @@ def render_html(report: Dict[str, Any]) -> str:
     env = report["environment"]
     out.append('<section><h2>被测环境与运行配置</h2><div class="kv">')
     for key, value in [
-        ("服务地址", cfg["target"]), ("API 根路径", API_ROOT),
-        ("认证 x-user-id", cfg["user_id"]), ("认证 x-role", cfg["role"]),
+        ("被测系统", backend_label), ("服务地址", cfg["target"]),
+        ("API 根路径", "/api/v1" if cfg.get("backend") == "weknora" else API_ROOT),
+        ("认证方式", "服务端 API Key / JWT" if cfg.get("backend") == "weknora" else "x-user-id / x-role"),
+        ("HTKnow 用户 ID", cfg["user_id"] if cfg.get("backend", "htknow") == "htknow" else "不适用"),
         ("OpenAPI 标题", env.get("openapi_title") or "-"),
         ("OpenAPI 版本", env.get("openapi_version") or "-"),
         ("知识库列表接口耗时", human_ms(env.get("kb_list_ms"))),
@@ -1686,7 +1743,7 @@ def upload_and_wait(client: Client, args: argparse.Namespace, kb_id: int,
         for file_id in list(outstanding):
             spec, record = outstanding[file_id]
             try:
-                payload, _ = client.get(f"{API_ROOT}/files/{file_id}")
+                payload, _ = file_record(client, file_id)
             except ApiFailure as exc:
                 record.stage, record.error = "upload_failed", str(exc)
                 del outstanding[file_id]
@@ -1725,12 +1782,19 @@ def finalize_parse(client: Client, args: argparse.Namespace, spec: DocSpec, reco
     record.parse_ms = elapsed_ms
     record.polls = polls
     record.status = payload.get("status")
+    record.backend_status = payload.get("backend_status")
     record.processing_status = payload.get("processing_status")
     record.wiki_status = payload.get("wiki_status")
     record.server_log = str(payload.get("log") or "")
     created, updated = payload.get("created_at"), payload.get("updated_at")
     if isinstance(created, int) and isinstance(updated, int):
         record.server_parse_s = max(0, updated - created)
+    elif isinstance(created, str) and isinstance(updated, str):
+        try:
+            record.server_parse_s = max(0, (datetime.fromisoformat(updated.replace("Z", "+00:00")) -
+                                            datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds())
+        except ValueError:
+            pass
     if "reus" in record.server_log.lower():
         record.reuse_detected = True
     if record.status not in TERMINAL_STATUS:
@@ -1965,6 +2029,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("target_positional", nargs="?", metavar="HOST:PORT",
                         help="位置参数形式的被测地址，等价于 --target")
     target = parser.add_argument_group("被测服务")
+    target.add_argument("--backend", choices=["htknow", "weknora"], default="htknow", help="被测系统，默认 htknow")
+    for name in ("template-kb", "embedding-model-id", "chat-model-id", "rerank-model-id", "tenant-id"):
+        target.add_argument("--weknora-" + name, default="", help="WeKnora 配置；也可使用对应的 WEKNORA_* 环境变量")
     target.add_argument("--target", help="HOST:PORT，例如 192.168.0.46:11000（也接受带 scheme 的写法）")
     target.add_argument("--host", help="主机名或 IP（与 --port 搭配使用）")
     target.add_argument("--port", type=int, default=3000, help="端口，默认 3000")
@@ -2156,7 +2223,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                       (args.docs or "").split(",") if args.docs else None,
                                       (args.exclude or "").split(",") if args.exclude else None)
     label = {"retrieval": "端到端检索测试", "chat": "生成答案测试", "both": "检索与答案完整测试"}[args.mode]
-    print(f"HTKnow {label} · run {run_id}")
+    print(f"{args.backend} {label} · run {run_id}")
     print(f"语料清单 {args.corpus_file}（version {manifest.get('version', '-')}），"
           f"选中文档 {len(specs)} 个，黄金问题 {sum(len(s.queries) for s in specs)} 条")
 
@@ -2174,9 +2241,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             size_bytes=path.stat().st_size, local_path=str(path), sha256=sha256_of(path),
             description=spec.description, started_at=report_started)))
 
+    if args.backend == "weknora" and not (args.target or args.target_positional or args.host or args.base_url):
+        args.base_url = os.getenv("WEKNORA_BASE_URL", "")
     base_url = None if args.dry_run else resolve_target(args)
-    client = Client(base_url or "http://127.0.0.1:1", args.user_id, args.role, args.user_name,
-                    args.http_timeout, args.retries, args.insecure, verbose=not args.quiet)
+    client = (Client("http://127.0.0.1:1", args.user_id, args.role, args.user_name,
+                     args.http_timeout, args.retries, args.insecure, verbose=False) if args.dry_run
+              else make_client(args, base_url))
 
     if args.corpus_cache:
         cache_dir = Path(args.corpus_cache).expanduser()
@@ -2248,11 +2318,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     json_path = Path(args.json_report) if args.json_report else report_path.with_suffix(".json")
     answers = None
     fixture_cleanup = []
+    session_clients = []
     if answer_module and answer_suite:
         print("\n执行对话答案评估（完整事件流与评审结果逐题保存）")
         answers = answer_module.run_suite(answer_suite, args, client, sys.modules[__name__], workdir,
                                           kb_id, docs, judge, report_path.parent / (report_path.stem + "-answers"))
         fixture_cleanup = answers.pop("_cleanup")
+        session_clients = answers.pop("_session_clients", [])
 
     print("\n[6/6] 计算指标与生成报告")
     metrics, parse, summarize_warnings = summarize(args, docs, queries, negatives, samples)
@@ -2267,7 +2339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     disposition = "保留（--cleanup keep）"
     if args.cleanup == "delete" or (args.cleanup == "delete-on-pass" and overall):
         try:
-            client.delete(f"{API_ROOT}/knowledge_base/{kb_id}")
+            delete_knowledge_base(client, kb_id)
             disposition = f"已删除 kb_id={kb_id}"
             print(f"  ✓ 已清理测试知识库 #{kb_id}")
         except ApiFailure as exc:
@@ -2280,7 +2352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         state = "保留现场"
         if args.cleanup == "delete" or (args.cleanup == "delete-on-pass" and overall):
             try:
-                fixture_client.delete(f"{API_ROOT}/knowledge_base/{fixture_id}")
+                delete_knowledge_base(fixture_client, fixture_id)
                 state = "已删除"
             except ApiFailure:
                 state = "删除失败"
@@ -2288,6 +2360,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fixture_dispositions.append({"kb_id": fixture_id, "disposition": state})
     if answers:
         answers["fixture_dispositions"] = fixture_dispositions
+        answers["session_dispositions"] = []
+        for session_client in session_clients:
+            sessions = list(session_client.backend.sessions)
+            state = "保留现场"
+            if args.cleanup == "delete" or (args.cleanup == "delete-on-pass" and overall):
+                try:
+                    session_client.backend.cleanup_sessions()
+                    state = "已删除"
+                except ApiFailure:
+                    state = "删除失败"
+                    warnings.append("WeKnora 测试会话清理失败")
+            answers["session_dispositions"].extend({"session_id": sid, "disposition": state} for sid in sessions)
         if answers["semantic_status"] != "complete":
             warnings.append("答案语义评估未完整完成；规则检查结果不能作为语义验收通过结论。")
 
@@ -2295,10 +2379,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_snapshot = {
-        "run_id": run_id, "mode": args.mode, "target": base_url, "kb_id": kb_id, "kb_name": kb_name,
+        "run_id": run_id, "backend": args.backend, "mode": args.mode, "target": base_url, "kb_id": kb_id, "kb_name": kb_name,
+        "backend_config": environment.get("models", {}),
         "report_path": str(report_path), "json_report_path": str(json_path),
         "kb_disposition": disposition, "user_id": args.user_id, "role": args.role,
-        "user_name": args.user_name, "slice_type": args.slice_type,
+        "user_name": args.user_name, "slice_type": args.slice_type if args.backend == "htknow" else "WeKnora 知识库配置",
         "top_k": args.top_k, "repeats": args.repeats, "parse_timeout": args.parse_timeout,
         "poll_interval": args.poll_interval, "http_timeout": args.http_timeout,
         "retries": args.retries, "upload_mode": args.upload_mode,
