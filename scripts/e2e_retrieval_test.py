@@ -1786,6 +1786,8 @@ def finalize_parse(client: Client, args: argparse.Namespace, spec: DocSpec, reco
     record.processing_status = payload.get("processing_status")
     record.wiki_status = payload.get("wiki_status")
     record.server_log = str(payload.get("log") or "")
+    if payload.get("parse_warning"):
+        record.notes.append(str(payload["parse_warning"]))
     created, updated = payload.get("created_at"), payload.get("updated_at")
     if isinstance(created, int) and isinstance(updated, int):
         record.server_parse_s = max(0, updated - created)
@@ -1981,6 +1983,9 @@ def summarize(args: argparse.Namespace, docs: Sequence[DocResult],
                                           "download_failed"):
             warnings.append(f"可选文档 {doc.doc_id} 未通过（{doc.stage}）："
                             f"{(doc.error or '无详细信息')[:180]}；不计入解析成功率门禁")
+        for note in doc.notes:
+            if str(note).startswith("WeKnora 文件处于 finalizing"):
+                warnings.append(f"文档 {doc.doc_id}：{note}")
     parse = {
         "evaluated": len(evaluated_docs),
         "evaluated_required": len(required_docs),

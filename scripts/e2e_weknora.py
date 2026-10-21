@@ -134,9 +134,28 @@ class WeKnoraBackend:
     def file_record(self, file_id: str):
         payload, elapsed = self.client.get(ROOT + "/knowledge/" + self.path(file_id))
         record = self.data(payload)
-        status = {"pending": 0, "processing": 2, "completed": 1, "failed": -1}.get(record.get("parse_status"))
-        return dict(record, status=status, backend_status=record.get("parse_status"),
-                    log=record.get("error_message") or record.get("parse_error") or ""), elapsed
+        backend_status = record.get("parse_status")
+        status = {"pending": 0, "processing": 2, "completed": 1, "failed": -1}.get(backend_status)
+        warning = ""
+        # WeKnora can leave a text file in `finalizing` after its summary
+        # subtask fails even though the parser has already written usable
+        # chunks. Treat that state as usable for retrieval/chat evaluation,
+        # while preserving the backend warning in the report.
+        if backend_status == "finalizing":
+            try:
+                chunk_count, _ = self.fetch_slices(file_id)
+            except (self.harness.ApiFailure, self.harness.HarnessError):
+                chunk_count = 0
+            if chunk_count > 0:
+                status = 1
+                summary_status = record.get("summary_status") or "unknown"
+                pending = record.get("pending_subtasks_count")
+                warning = (f"WeKnora 文件处于 finalizing，但已生成 {chunk_count} 个可用切片；"
+                           f"summary_status={summary_status}，pending_subtasks_count={pending}。"
+                           "已继续评测，摘要任务异常请检查 WeKnora 后台任务。")
+        log = record.get("error_message") or record.get("parse_error") or ""
+        return dict(record, status=status, backend_status=backend_status,
+                    parse_warning=warning, log="; ".join(x for x in (log, warning) if x)), elapsed
 
     def fetch_slices(self, file_id: str):
         page, count, chars = 1, 0, 0

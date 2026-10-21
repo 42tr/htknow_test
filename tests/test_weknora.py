@@ -87,6 +87,11 @@ class MockWeKnora:
                     fid = path.rsplit("/", 1)[-1]
                     record = outer.files[fid]
                     record["polls"] += 1
+                    if outer.mode == "finalizing":
+                        return self.send({"success": True, "data": {"id": fid,
+                            "parse_status": "finalizing", "summary_status": "failed",
+                            "pending_subtasks_count": 1,
+                            "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:00:01Z"}})
                     return self.send({"success": True, "data": {"id": fid,
                         "parse_status": "processing" if record["polls"] == 1 else "completed",
                         "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:00:01Z"}})
@@ -305,6 +310,25 @@ class WeKnoraTests(unittest.TestCase):
         harness.delete_knowledge_base(self.client, kb)
         self.assertNotIn(kb, self.service.kbs)
         self.assertNotIn("template", self.service.kbs)
+
+    def test_finalizing_file_with_chunks_is_usable_and_reports_summary_warning(self):
+        self.service.mode = "finalizing"
+        kb, _ = harness.create_knowledge_base(self.client, "finalizing", "test", 90, False)
+        path = self.directory / "finalizing.txt"
+        path.write_text("Wiki 对照正文。")
+        fid, _ = harness.upload_document(self.client, kb, path, "smart", [])
+        record, _, polls = harness.wait_for_parse(self.client, fid, 3, .001, False)
+        self.assertEqual(record["status"], 1)
+        self.assertEqual(record["backend_status"], "finalizing")
+        self.assertIn("summary_status=failed", record["parse_warning"])
+        self.assertEqual(polls, 1)
+        self.assertEqual(harness.fetch_slices(self.client, fid)[0], 1)
+        doc = harness.DocResult(doc_id="finalizing", filename=path.name, fmt="txt",
+                                language="zh", optional=False, stage="ready", kb_file_id=fid)
+        spec = harness.DocSpec(id="finalizing", filename=path.name, fmt="txt")
+        harness.finalize_parse(self.client, self.args, spec, doc, record, 1, polls)
+        _, _, warnings = harness.summarize(self.args, [doc], [], [], [])
+        self.assertTrue(any("summary_status=failed" in warning for warning in warnings))
 
     def test_template_configuration_and_wiki_native_kind(self):
         kb, _ = harness.create_knowledge_base(self.client, "wiki", "test", 90, False, wiki=True)
